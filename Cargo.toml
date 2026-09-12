@@ -35,7 +35,7 @@ tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "
 toml        = "0.9"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_System_Console", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Foundation"] }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
