@@ -32,7 +32,7 @@ serde_json  = "1"
 spdlog-rs   = { version = "0.5", features = ["flexible-string"] }
 thiserror   = "2"
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "sync"] }
-toml        = "0.9"
+toml        = "1.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_System_Console", "Win32_Foundation"] }
