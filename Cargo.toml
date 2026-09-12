@@ -38,7 +38,7 @@ toml        = "0.9"
 windows-sys = { version = "0.60", features = ["Win32_System_Console", "Win32_Foundation"] }
 
 [target.'cfg(unix)'.dependencies]
-signal-hook = "0.3"
+signal-hook = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
