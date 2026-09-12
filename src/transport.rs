@@ -58,7 +58,7 @@ pub enum IpcListener {
 }
 
 /// Bind the daemon endpoint. Fails if another daemon owns it.
-pub async fn bind(path: &str) -> std::io::Result<IpcListener> {
+pub fn bind(path: &str) -> std::io::Result<IpcListener> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

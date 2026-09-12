@@ -34,27 +34,32 @@ pub struct ScriptSpec<'a> {
 }
 
 /// Remote path the wrapper script is uploaded to.
+#[must_use]
 pub fn remote_script_path(nonce_hex: &str) -> String {
     format!("/tmp/.sp-{nonce_hex}.sh")
 }
 
 /// POSIX single-quote escape for embedding text inside `'...'` in bash.
+#[must_use]
 pub fn sq_escape(s: &str) -> String {
     s.replace('\'', r"'\''")
 }
 
 /// Build the full wrapper script uploaded to the remote host.
+#[must_use]
 pub fn build(spec: &ScriptSpec<'_>) -> String {
+    use std::fmt::Write as _;
+
     let nonce = spec.nonce_hex;
     let delim = format!("__SP_{nonce}__");
 
     let mut inner = String::new();
     if let Some(cwd) = spec.cwd {
         let e = sq_escape(cwd);
-        inner.push_str(&format!(
-            "if ! cd -- '{e}'; then printf 'sp: cannot cd to {e}, using $HOME\\n' >&2; cd -- ~; \
-             fi\n"
-        ));
+        let _ = writeln!(
+            inner,
+            "if ! cd -- '{e}'; then printf 'sp: cannot cd to {e}, using $HOME\\n' >&2; cd -- ~; fi"
+        );
     }
     if !spec.args.is_empty() {
         let args: Vec<String> = spec
@@ -62,17 +67,18 @@ pub fn build(spec: &ScriptSpec<'_>) -> String {
             .iter()
             .map(|a| format!("'{}'", sq_escape(a)))
             .collect();
-        inner.push_str(&format!("set -- {}\n", args.join(" ")));
+        let _ = writeln!(inner, "set -- {}", args.join(" "));
     }
     inner.push_str(spec.command);
     inner.push('\n');
     // Capture rc before anything else runs; the marker goes to stdout and is
     // stripped client-side. `exec 2>/dev/null` before `exit` hides the "exit"
     // line interactive bash prints to stderr for its own exit builtin.
-    inner.push_str(&format!(
+    let _ = write!(
+        inner,
         "__sp_rc=$?\nprintf '\\034SPM:{nonce}:%s\\034' \"$(printf %s \"$PWD\" | base64 | tr -d \
          '\\n')\"\nexec 2>/dev/null\nexit $__sp_rc\n"
-    ));
+    );
 
     let inner_escaped = sq_escape(&inner);
 
@@ -87,7 +93,7 @@ pub fn build(spec: &ScriptSpec<'_>) -> String {
 mod tests {
     use super::*;
 
-    fn spec<'a>(command: &'a str) -> ScriptSpec<'a> {
+    fn spec(command: &str) -> ScriptSpec<'_> {
         ScriptSpec {
             command,
             args: &[],

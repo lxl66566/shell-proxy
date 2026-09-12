@@ -33,13 +33,13 @@ pub struct ResolvedHost {
 pub async fn resolve(host: &str) -> Result<ResolvedHost> {
     match run_ssh_g(host).await {
         Ok(r) => Ok(r),
-        Err(reason) => Ok(fallback(host, reason)),
+        // ssh -G broken or absent: best-effort direct connection.
+        Err(_) => Ok(fallback(host)),
     }
 }
 
 /// Direct connection fallback used when `ssh -G` cannot run at all.
-fn fallback(host: &str, reason: Error) -> ResolvedHost {
-    let _ = reason; // already surfaced elsewhere; keep connecting best-effort
+fn fallback(host: &str) -> ResolvedHost {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "root".into());
@@ -179,6 +179,7 @@ fn parse_ssh_g_output(host: &str, text: &str) -> Result<ResolvedHost> {
 }
 
 /// Expand %h/%p/%n tokens in a ProxyCommand.
+#[must_use]
 pub fn expand_proxy_command(cmd: &str, hostname: &str, port: u16) -> String {
     cmd.replace("%h", hostname)
         .replace("%p", &port.to_string())
@@ -187,10 +188,10 @@ pub fn expand_proxy_command(cmd: &str, hostname: &str, port: u16) -> String {
 
 /// Expand a leading `~` to the user's home directory (`ssh -G` emits `~/...`).
 fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest).to_string_lossy().into_owned();
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest).to_string_lossy().into_owned();
     }
     path.to_owned()
 }
@@ -217,7 +218,6 @@ fn split_values(value: &str) -> Vec<String> {
                 quote = None;
                 cur.push(ch);
             },
-            Some(_) => cur.push(ch),
             None if ch == '"' || ch == '\'' => {
                 quote = Some(ch);
                 cur.push(ch);
@@ -227,7 +227,7 @@ fn split_values(value: &str) -> Vec<String> {
                     out.push(std::mem::take(&mut cur));
                 }
             },
-            None => cur.push(ch),
+            Some(_) | None => cur.push(ch),
         }
     }
     if !cur.is_empty() {

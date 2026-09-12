@@ -50,7 +50,6 @@ pub async fn run() -> Result<()> {
     init_logger().map_err(|e| Error::Daemon(format!("init logging: {e}")))?;
     let sock_path = config::sock_path();
     let listener = crate::transport::bind(&sock_path)
-        .await
         .map_err(|e| Error::Daemon(format!("bind {sock_path}: {e}")))?;
 
     info!("daemon started pid={} sock={sock_path}", std::process::id());
@@ -92,7 +91,7 @@ pub async fn run() -> Result<()> {
                 info!("idle timeout reached, exiting");
                 return Ok(());
             }
-            _ = idle_now.notified(), if deadline == far => {
+            () = idle_now.notified(), if deadline == far => {
                 // Last connection finished; loop again to re-arm the timer.
             }
         }
@@ -327,16 +326,16 @@ fn abbreviate(s: &str) -> String {
 
 fn new_nonce() -> String {
     let bytes: [u8; 16] = rand::random();
-    hex_simd::encode_to_string(&bytes, hex_simd::AsciiCase::Lower)
+    hex_simd::encode_to_string(bytes, hex_simd::AsciiCase::Lower)
 }
 
 /// Get a live connection for `host`, connecting (or reconnecting) as needed.
 async fn get_or_connect(shared: &Arc<Shared>, host: &str) -> Result<Arc<HostState>> {
     let mut hosts = shared.hosts.lock().await;
-    if let Some(state) = hosts.get(host) {
-        if !state.conn.is_closed() {
-            return Ok(Arc::clone(state));
-        }
+    if let Some(state) = hosts.get(host)
+        && !state.conn.is_closed()
+    {
+        return Ok(Arc::clone(state));
     }
     let state = connect_state(host).await?;
     hosts.insert(host.to_owned(), Arc::clone(&state));
@@ -361,18 +360,18 @@ fn init_logger() -> std::io::Result<()> {
     let dir = config::app_dir().join("logs");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("daemon.log");
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > ROTATE_BYTES {
-            let _ = std::fs::rename(&path, dir.join("daemon.log.old"));
-        }
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() > ROTATE_BYTES
+    {
+        let _ = std::fs::rename(&path, dir.join("daemon.log.old"));
     }
     let sink = FileSink::builder()
         .path(&path)
         .build()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let level = config::load_config()
-        .map(|c| parse_level(&c.log_level))
-        .unwrap_or(LevelFilter::MoreSevere(Level::Info));
+    let level = config::load_config().map_or(LevelFilter::MoreSevere(Level::Info), |c| {
+        parse_level(&c.log_level)
+    });
     let logger = Logger::builder()
         .sink(Arc::new(sink))
         .level_filter(level)

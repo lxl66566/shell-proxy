@@ -18,32 +18,30 @@ use crate::{
 /// Connect to the daemon, spawning it if it is not running yet.
 pub async fn connect_or_spawn() -> Result<IpcStream> {
     let path = config::sock_path();
-    match IpcStream::connect(&path).await {
-        Ok(s) => Ok(s),
-        Err(_) => {
-            #[cfg(unix)]
-            if path.starts_with('/') {
-                // A leftover socket from a dead daemon blocks the bind.
-                let _ = std::fs::remove_file(&path);
-            }
-            spawn_daemon().await?;
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                match IpcStream::connect(&path).await {
-                    Ok(s) => return Ok(s),
-                    Err(e) if std::time::Instant::now() >= deadline => {
-                        return Err(Error::Daemon(format!(
-                            "daemon did not come up at {path}: {e}"
-                        )));
-                    },
-                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-                }
-            }
-        },
+    if let Ok(s) = IpcStream::connect(&path).await {
+        return Ok(s);
+    }
+    #[cfg(unix)]
+    if path.starts_with('/') {
+        // A leftover socket from a dead daemon blocks the bind.
+        let _ = std::fs::remove_file(&path);
+    }
+    spawn_daemon()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match IpcStream::connect(&path).await {
+            Ok(s) => return Ok(s),
+            Err(e) if std::time::Instant::now() >= deadline => {
+                return Err(Error::Daemon(format!(
+                    "daemon did not come up at {path}: {e}"
+                )));
+            },
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
     }
 }
 
-async fn spawn_daemon() -> Result<()> {
+fn spawn_daemon() -> Result<()> {
     let exe = std::env::current_exe().map_err(|e| Error::Daemon(format!("current_exe: {e}")))?;
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("daemon")
@@ -64,8 +62,8 @@ async fn spawn_daemon() -> Result<()> {
         cmd.process_group(0);
     }
     cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| Error::Daemon(format!("spawn daemon {}: {e}", exe.display())))
+        .map_err(|e| Error::Daemon(format!("spawn daemon {}: {e}", exe.display())))?;
+    Ok(())
 }
 
 /// Ping the daemon without spawning it; returns its pid.
@@ -130,7 +128,9 @@ pub async fn run(
     let mut stdin = stdin;
     let mut stdout = stdout;
     let mut stderr = stderr;
-    let mut in_buf = [0u8; 64 * 1024];
+    // Heap-allocated: a stack array here would make every caller's future
+    // huge (clippy::large_futures).
+    let mut in_buf = vec![0u8; 64 * 1024];
     let mut stdin_open = true;
     let mut signals_open = true;
 

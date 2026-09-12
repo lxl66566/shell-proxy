@@ -23,6 +23,7 @@ pub struct MarkerFilter {
 }
 
 impl MarkerFilter {
+    #[must_use]
     pub fn new(nonce_hex: &str) -> Self {
         Self {
             marker_start: format!("{MARKER_PREFIX}{nonce_hex}:").into_bytes(),
@@ -90,6 +91,7 @@ impl MarkerFilter {
     }
 
     /// Finalize the stream: returns leftover data plus the parsed cwd.
+    #[must_use]
     pub fn finish(mut self) -> (Vec<u8>, Option<String>) {
         if self.finished {
             return (Vec::new(), self.cwd);
@@ -149,7 +151,7 @@ mod tests {
         assert_eq!(f.push(&m[..5]), b"");
         assert_eq!(f.push(&m[5..]), b"");
         let (rest, cwd) = f.finish();
-        assert!(rest.is_empty());
+        assert_eq!(rest, b"");
         assert_eq!(cwd.as_deref(), Some("/var/log"));
     }
 
@@ -160,7 +162,7 @@ mod tests {
         // '!' is neither base64 nor the terminator: the held prefix is data.
         assert_eq!(f.push(b":more!"), b"\x1cSPM:n:more!");
         let (rest, cwd) = f.finish();
-        assert!(rest.is_empty());
+        assert_eq!(rest, b"");
         assert!(cwd.is_none());
     }
 
@@ -186,7 +188,7 @@ mod tests {
         let data: Vec<u8> = vec![0, 0x1c, 255, 0x1c, 0];
         assert_eq!(f.push(&data), data);
         let (rest, cwd) = f.finish();
-        assert!(rest.is_empty());
+        assert_eq!(rest, b"");
         assert!(cwd.is_none());
     }
 
@@ -198,7 +200,7 @@ mod tests {
         let out = f.push(&chunk);
         assert_eq!(out.len(), chunk.len());
         let (rest, cwd) = f.finish();
-        assert!(rest.is_empty());
+        assert_eq!(rest, b"");
         assert!(cwd.is_none());
     }
 
@@ -211,7 +213,7 @@ mod tests {
         assert_eq!(f.push(&data), b"ok");
         assert_eq!(f.push(b"more"), b"");
         let (rest, cwd) = f.finish();
-        assert!(rest.is_empty());
+        assert_eq!(rest, b"");
         assert_eq!(cwd.as_deref(), Some("/root"));
     }
 }

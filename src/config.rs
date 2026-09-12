@@ -31,10 +31,10 @@ impl Default for Config {
 }
 
 /// Per-user application directory (`%APPDATA%/shell-proxy` or `~/.config/shell-proxy`).
+#[must_use]
 pub fn app_dir() -> PathBuf {
-    let base = dirs::config_dir()
-        .map(|d| d.join("shell-proxy"))
-        .unwrap_or_else(|| PathBuf::from(".shell-proxy"));
+    let base =
+        dirs::config_dir().map_or_else(|| PathBuf::from(".shell-proxy"), |d| d.join("shell-proxy"));
     let _ = std::fs::create_dir_all(&base);
     base
 }
@@ -42,11 +42,12 @@ pub fn app_dir() -> PathBuf {
 /// Path of the daemon IPC endpoint.
 ///
 /// Windows uses a named pipe, other platforms a unix socket inside the app dir.
+#[must_use]
 pub fn sock_path() -> String {
-    if let Ok(p) = std::env::var(ENV_SOCK) {
-        if !p.is_empty() {
-            return p;
-        }
+    if let Ok(p) = std::env::var(ENV_SOCK)
+        && !p.is_empty()
+    {
+        return p;
     }
     if cfg!(windows) {
         let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
@@ -82,10 +83,10 @@ pub fn resolve_host(cli: Option<&str>) -> Result<String> {
     if let Some(h) = cli {
         return Ok(h.to_owned());
     }
-    if let Ok(h) = std::env::var(ENV_HOST) {
-        if !h.is_empty() {
-            return Ok(h);
-        }
+    if let Ok(h) = std::env::var(ENV_HOST)
+        && !h.is_empty()
+    {
+        return Ok(h);
     }
     load_config()?
         .host

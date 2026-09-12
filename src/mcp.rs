@@ -59,6 +59,8 @@ impl SpMcp {
     }
 }
 
+// The `tool_handler` macro generates an async `call` without awaits.
+#[allow(clippy::unused_async_trait_impl)]
 #[tool_handler]
 impl ServerHandler for SpMcp {
     fn get_info(&self) -> ServerInfo {

@@ -5,6 +5,7 @@
 //! every test skips itself with a notice instead of failing.
 
 use std::{
+    process::Command,
     sync::{
         OnceLock,
         atomic::{AtomicU8, Ordering},
@@ -47,7 +48,7 @@ fn harness() -> &'static Harness {
             std::env::set_var("SP_IDLE_SECS", "300");
         }
 
-        let daemon = std::process::Command::new(env!("CARGO_BIN_EXE_sp"))
+        let daemon = Command::new(env!("CARGO_BIN_EXE_sp"))
             .arg("daemon")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -111,7 +112,7 @@ async fn echo_stdout() {
     let (rep, out, err) = run("echo hello", None, None).await.unwrap();
     assert_eq!(rep.code, 0);
     assert_eq!(out_str(&out), "hello\n");
-    assert!(err.is_empty());
+    assert_eq!(err, b"");
 }
 
 #[tokio::test]
@@ -127,7 +128,7 @@ async fn command_not_found() {
     let Some(_g) = guard().await else { return };
     let (rep, out, err) = run("definitely_not_a_cmd_xyz", None, None).await.unwrap();
     assert_eq!(rep.code, 127);
-    assert!(out.is_empty());
+    assert_eq!(out, b"");
     assert!(out_str(&err).contains("command not found"));
 }
 
@@ -308,7 +309,6 @@ async fn no_leftover_scripts() {
 #[tokio::test]
 async fn cli_exit_code_passthrough() {
     let Some(_g) = guard().await else { return };
-    use std::process::Command;
     let out = Command::new(env!("CARGO_BIN_EXE_sp"))
         .args(["--host", &harness().host, "exit", "33"])
         .output()

@@ -13,8 +13,11 @@ use crate::ipc::Signal;
 #[cfg(windows)]
 pub fn install(tx: mpsc::Sender<Signal>) {
     static SINK: std::sync::OnceLock<mpsc::Sender<Signal>> = std::sync::OnceLock::new();
-    let _ = SINK.set(tx);
 
+    /// # Safety
+    ///
+    /// Must have the exact signature `SetConsoleCtrlHandler` expects; the OS
+    /// invokes it on an arbitrary thread during console events.
     unsafe extern "system" fn handler(ctrl_type: u32) -> i32 {
         const CTRL_C_EVENT: u32 = 0;
         const CTRL_BREAK_EVENT: u32 = 1;
@@ -28,6 +31,8 @@ pub fn install(tx: mpsc::Sender<Signal>) {
         }
         TRUE // handled: keep running until the remote exit code arrives
     }
+
+    let _ = SINK.set(tx);
 
     // SAFETY: `handler` is a valid extern function; registration is idempotent.
     unsafe {

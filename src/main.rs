@@ -11,9 +11,9 @@ use shell_proxy::{
 use tokio::sync::mpsc;
 
 /// Exit code for daemon/internal errors.
-const EXIT_INTERNAL: u32 = 254;
+const EXIT_INTERNAL: u8 = 254;
 /// Exit code for timed-out commands, matching timeout(1).
-const EXIT_TIMEOUT: u32 = 124;
+const EXIT_TIMEOUT: u8 = 124;
 
 #[derive(Parser)]
 #[command(
@@ -66,14 +66,14 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("sp: daemon error: {}", e.brief());
-                ExitCode::from(EXIT_INTERNAL as u8)
+                ExitCode::from(EXIT_INTERNAL)
             },
         },
         Some(Sub::Mcp) => match shell_proxy::mcp::run().await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("sp: mcp error: {e:#}");
-                ExitCode::from(EXIT_INTERNAL as u8)
+                ExitCode::from(EXIT_INTERNAL)
             },
         },
         Some(Sub::Status) => match client::ping().await {
@@ -99,7 +99,7 @@ async fn run_command(cli: Cli) -> ExitCode {
         },
         Err(e) => {
             eprintln!("sp: {e}");
-            return ExitCode::from(EXIT_INTERNAL as u8);
+            return ExitCode::from(EXIT_INTERNAL);
         },
     };
 
@@ -107,7 +107,7 @@ async fn run_command(cli: Cli) -> ExitCode {
         Ok(h) => h,
         Err(e) => {
             eprintln!("sp: {e}");
-            return ExitCode::from(EXIT_INTERNAL as u8);
+            return ExitCode::from(EXIT_INTERNAL);
         },
     };
 
@@ -132,13 +132,14 @@ async fn run_command(cli: Cli) -> ExitCode {
         Ok(report) => {
             if report.timed_out {
                 eprintln!("sp: command timed out");
-                return ExitCode::from(EXIT_TIMEOUT as u8);
+                return ExitCode::from(EXIT_TIMEOUT);
             }
-            ExitCode::from(report.code as u8)
+            // Out-of-range codes never come from a shell; treat them as internal errors.
+            ExitCode::from(u8::try_from(report.code).unwrap_or(EXIT_INTERNAL))
         },
         Err(e) => {
             eprintln!("sp: {e}");
-            ExitCode::from(EXIT_INTERNAL as u8)
+            ExitCode::from(EXIT_INTERNAL)
         },
     }
 }

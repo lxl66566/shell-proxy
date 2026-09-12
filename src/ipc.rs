@@ -22,6 +22,7 @@ pub enum Signal {
 }
 
 impl Signal {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Signal::Int => "int",
@@ -224,9 +225,11 @@ pub async fn write_daemon_frame<W: AsyncWrite + Unpin>(
 }
 
 async fn write_raw<W: AsyncWrite + Unpin>(w: &mut W, kind: u8, payload: &[u8]) -> Result<()> {
+    let len = u32::try_from(payload.len())
+        .map_err(|_| Error::Protocol(format!("frame too large: {}", payload.len())))?;
     let mut buf = Vec::with_capacity(5 + payload.len());
     buf.push(kind);
-    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(payload);
     w.write_all(&buf).await?;
     Ok(())

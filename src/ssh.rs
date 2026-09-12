@@ -33,6 +33,8 @@ pub struct ClientHandler {
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
+    // Signature is dictated by the russh trait; the future shape is not ours to choose.
+    #[allow(clippy::unused_async_trait_impl)]
     async fn check_server_key(
         &mut self,
         key: &PublicKeyOrCertificate,
@@ -101,10 +103,12 @@ pub struct SshConnection {
 }
 
 impl SshConnection {
+    #[must_use]
     pub fn handle(&self) -> &SshHandle {
         &self.handle
     }
 
+    #[must_use]
     pub fn is_closed(&self) -> bool {
         self.handle.is_closed()
     }
@@ -134,9 +138,8 @@ pub async fn connect(resolved: ResolvedHost) -> Result<SshConnection> {
     let mut proxy_child = None;
     let mut handle = if let Some(pc) = resolved.proxy_command.as_deref() {
         let cmd = expand_proxy_command(pc, &resolved.hostname, resolved.port);
-        let (stream, child) = spawn_proxy(&cmd)
-            .await
-            .map_err(|e| Error::Connect(format!("proxycommand {cmd:?}: {e}")))?;
+        let (stream, child) =
+            spawn_proxy(&cmd).map_err(|e| Error::Connect(format!("proxycommand {cmd:?}: {e}")))?;
         proxy_child = Some(child);
         client::connect_stream(config, stream, handler)
             .await
@@ -167,7 +170,7 @@ pub async fn connect(resolved: ResolvedHost) -> Result<SshConnection> {
 type ProxyStream = tokio::io::Join<ChildStdout, ChildStdin>;
 
 /// Spawn a ProxyCommand, wiring its stdout->russh read side and stdin->write side.
-async fn spawn_proxy(cmd: &str) -> std::io::Result<(ProxyStream, Child)> {
+fn spawn_proxy(cmd: &str) -> std::io::Result<(ProxyStream, Child)> {
     let mut command = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(cmd);
@@ -194,18 +197,18 @@ async fn authenticate(handle: &mut SshHandle, resolved: &ResolvedHost) -> Result
     let user = resolved.user.clone();
 
     // 1. ssh-agent
-    if let Ok(mut agent) = connect_agent().await {
-        if let Ok(identities) = agent.request_identities().await {
-            for identity in identities {
-                let pubkey = identity.public_key().into_owned();
-                if matches!(
-                    handle
-                        .authenticate_publickey_with(&user, pubkey, None, &mut agent)
-                        .await,
-                    Ok(client::AuthResult::Success)
-                ) {
-                    return Ok(());
-                }
+    if let Ok(mut agent) = connect_agent().await
+        && let Ok(identities) = agent.request_identities().await
+    {
+        for identity in identities {
+            let pubkey = identity.public_key().into_owned();
+            if matches!(
+                handle
+                    .authenticate_publickey_with(&user, pubkey, None, &mut agent)
+                    .await,
+                Ok(client::AuthResult::Success)
+            ) {
+                return Ok(());
             }
         }
     }

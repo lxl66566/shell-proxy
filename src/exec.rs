@@ -96,7 +96,9 @@ pub async fn execute(
             let ev = match msg {
                 ChannelMsg::Data { data } => ChanEvent::Stdout(data.to_vec()),
                 ChannelMsg::ExtendedData { data, ext: 1 } => ChanEvent::Stderr(data.to_vec()),
-                ChannelMsg::ExitStatus { exit_status } => ChanEvent::Exit(exit_status as i32),
+                ChannelMsg::ExitStatus { exit_status } => {
+                    ChanEvent::Exit(to_exit_code(exit_status))
+                },
                 ChannelMsg::ExitSignal {
                     signal_name,
                     error_message,
@@ -131,11 +133,12 @@ pub async fn execute(
         let sel = tokio::select! {
             ev = msg_rx.recv() => Sel::Msg(ev),
             ev = input.recv(), if input_open => Sel::In(ev),
-            _ = tokio::time::sleep_until(drain_at.unwrap_or(far)), if drain_at.is_some() => Sel::Drain,
-            _ = tokio::time::sleep_until(deadline.unwrap_or(far)), if deadline.is_some() && !timed_out => Sel::Timeout,
+            () = tokio::time::sleep_until(drain_at.unwrap_or(far)), if drain_at.is_some() => Sel::Drain,
+            () = tokio::time::sleep_until(deadline.unwrap_or(far)), if deadline.is_some() && !timed_out => Sel::Timeout,
         };
         match sel {
-            Sel::Msg(None) => {
+            // Connection closed without (or after) a status: nothing left to read.
+            Sel::Msg(None | Some(ChanEvent::Close)) => {
                 if exit.is_none() {
                     exit = Some(NO_STATUS_CODE);
                 }
@@ -166,12 +169,6 @@ pub async fn execute(
                 if exit.is_some() {
                     break;
                 }
-            },
-            Sel::Msg(Some(ChanEvent::Close)) => {
-                if exit.is_none() {
-                    exit = Some(NO_STATUS_CODE);
-                }
-                break;
             },
             Sel::In(Some(InputEvent::Stdin(d))) => {
                 writer
@@ -235,7 +232,7 @@ async fn upload_script(handle: &SshHandle, script_text: String, nonce_hex: &str)
     let mut status: Option<i32> = None;
     while let Some(msg) = reader.wait().await {
         match msg {
-            ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status as i32),
+            ChannelMsg::ExitStatus { exit_status } => status = Some(to_exit_code(exit_status)),
             ChannelMsg::Close => break,
             _ => {},
         }
@@ -271,4 +268,9 @@ fn signal_exit_code(sig: &Sig) -> i32 {
         _ => 0,
     };
     128 + num
+}
+
+/// SSH exit statuses are shell exit codes (0..=255); anything else is garbage.
+fn to_exit_code(exit_status: u32) -> i32 {
+    i32::try_from(exit_status).unwrap_or(NO_STATUS_CODE)
 }

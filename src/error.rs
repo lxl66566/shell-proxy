@@ -50,6 +50,7 @@ pub enum Error {
 
 impl Error {
     /// Human oriented short reason, used by the CLI to print one-line errors.
+    #[must_use]
     pub fn brief(&self) -> String {
         format!("{self}")
     }
