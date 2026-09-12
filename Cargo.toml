@@ -23,7 +23,7 @@ base64-simd = "0.8"
 clap        = { version = "4", features = ["derive"] }
 dirs        = "6"
 hex-simd    = "0.8"
-rand        = "0.9"
+rand        = "0.10"
 rmcp        = { version = "3", features = ["transport-io"] }
 schemars    = "1"
 russh       = { version = "0.63", default-features = false, features = ["ring", "rsa"] }
