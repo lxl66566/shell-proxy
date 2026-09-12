@@ -37,7 +37,7 @@ cargo install shell-proxy
 ```sh
 # 首次配置：指定默认主机（别名来自 ~/.ssh/config）
 mkdir -p ~/.config/shell-proxy && echo 'host = "ls"' > ~/.config/shell-proxy/config.toml
-# Windows: %APPDATA%\shell-proxy\config.toml
+# Windows: $XDG_CONFIG_HOME/shell-proxy/config.toml
 
 sp ls -alF                     # 执行命令
 sp "echo 333 | grep 3"         # 管道、引号：整条加引号最可靠
@@ -75,7 +75,7 @@ sp daemon                      # 手动前台运行 daemon（通常无需，会�
 
 ## 配置
 
-`config.toml`（`~/.config/shell-proxy/` 或 `%APPDATA%\shell-proxy\`）：
+`config.toml`（优先 `$XDG_CONFIG_HOME/shell-proxy/`，否则 `~/.config/shell-proxy/` 或 Windows `%APPDATA%\shell-proxy\`）：
 
 ```toml
 host = "ls"        # 默认主机别名

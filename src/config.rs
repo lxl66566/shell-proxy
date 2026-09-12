@@ -30,13 +30,24 @@ impl Default for Config {
     }
 }
 
-/// Per-user application directory (`%APPDATA%/shell-proxy` or `~/.config/shell-proxy`).
+/// Per-user application directory.
+///
+/// `$XDG_CONFIG_HOME/shell-proxy` when `XDG_CONFIG_HOME` is set to an
+/// absolute path (honored on all platforms); otherwise `dirs::config_dir()`
+/// (`%APPDATA%` on Windows, `~/.config` on Unix).
 #[must_use]
 pub fn app_dir() -> PathBuf {
-    let base =
-        dirs::config_dir().map_or_else(|| PathBuf::from(".shell-proxy"), |d| d.join("shell-proxy"));
-    let _ = std::fs::create_dir_all(&base);
-    base
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        // XDG spec: relative values must be ignored
+        .filter(|p| p.is_absolute());
+    let base = xdg
+        .or_else(dirs::config_dir)
+        .unwrap_or_else(|| PathBuf::from(".shell-proxy"));
+    let dir = base.join("shell-proxy");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 /// Path of the daemon IPC endpoint.
@@ -97,4 +108,25 @@ pub fn resolve_host(cli: Option<&str>) -> Result<String> {
                 app_dir().join("config.toml").display()
             ))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_dir_prefers_absolute_xdg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: no other test in this binary touches XDG_CONFIG_HOME
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        assert_eq!(app_dir(), tmp.path().join("shell-proxy"));
+        // relative value is ignored per XDG spec
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", "rel/path") };
+        assert_ne!(app_dir(), PathBuf::from("rel/path").join("shell-proxy"));
+        match old {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+    }
 }
