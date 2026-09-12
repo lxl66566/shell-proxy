@@ -1,18 +1,47 @@
 [package]
-name         = "xxx"
+name         = "shell-proxy"
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.85"
-description  = "xxx"
-readme       = "README.md"
-homepage     = "https://github.com/lxl66566/xxx"
-repository   = "https://github.com/lxl66566/xxx"
+rust-version = "1.88"
+description  = "Run local commands on a remote Linux host with persistent shell state"
+repository   = "https://github.com/lxl66566/shell-proxy"
 license      = "MIT OR Apache-2.0"
-keywords     = ["xxx"]
-categories   = ["xxx"]
+keywords     = ["ssh", "shell", "remote", "proxy", "cli"]
+categories   = ["command-line-utilities", "development-tools"]
 include      = ["/CHANGELOG.md", "/LICENSE-*", "/README.md", "/benches/**", "/src/**", "/tests/**"]
 
+[lib]
+name = "shell_proxy"
+
+[[bin]]
+name = "sp"
+path = "src/main.rs"
+
 [dependencies]
+anyhow      = "1"
+base64-simd = "0.8"
+clap        = { version = "4", features = ["derive"] }
+dirs        = "6"
+hex-simd    = "0.8"
+rand        = "0.9"
+rmcp        = { version = "3", features = ["transport-io"] }
+schemars    = "1"
+russh       = { version = "0.63", default-features = false, features = ["ring", "rsa"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+spdlog-rs   = { version = "0.5", features = ["flexible-string"] }
+thiserror   = "2"
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "sync"] }
+toml        = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_System_Console", "Win32_Foundation"] }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints.clippy]
 all                     = { level = "warn", priority = -1 }
@@ -28,9 +57,8 @@ wildcard_imports        = "allow"
 unsafe_code           = "allow"
 unused_qualifications = "warn"
 
-# If you are building bin target, uncomment this
-# [profile.release]
-# lto       = true
-# opt-level = "s"
-# panic     = "abort"
-# strip     = true
+[profile.release]
+lto       = true
+opt-level = "s"
+panic     = "abort"
+strip     = true
