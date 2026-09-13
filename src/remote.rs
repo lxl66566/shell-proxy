@@ -131,11 +131,67 @@ pub async fn execute(
         }
     });
 
+    // Frame forwarder owning the channel write half. The control loop below
+    // must never await a channel write: with the remote stdin window full
+    // (serve applying backpressure because the child is not reading) the
+    // write blocks, and that must not stall signal forwarding or completion.
+    // Signals get a dedicated lane with biased priority; stdin data is queued
+    // and only dropped - loudly - once every buffer in the pipeline is full.
+    let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (sig_tx, mut sig_rx) = mpsc::channel::<Signal>(8);
+    let forwarder = tokio::spawn(async move {
+        let mut writer = writer;
+        let mut data_open = true;
+        loop {
+            if !data_open {
+                match sig_rx.recv().await {
+                    Some(sig) => {
+                        if send_frame(&writer, &ExecFrame::Signal(sig)).await.is_err() {
+                            break;
+                        }
+                    },
+                    None => break,
+                }
+                continue;
+            }
+            tokio::select! {
+                biased;
+                sig = sig_rx.recv() => {
+                    if let Some(sig) = sig {
+                        if send_frame(&writer, &ExecFrame::Signal(sig)).await.is_err() {
+                            break;
+                        }
+                    }
+                },
+                d = data_rx.recv() => {
+                    match d {
+                        Some(d) => {
+                            if send_frame(&writer, &ExecFrame::StdinData(d)).await.is_err() {
+                                break;
+                            }
+                        },
+                        None => {
+                            // Data lane closed and drained: forward EOF, then
+                            // stay alive for late signals.
+                            let _ = send_frame(&writer, &ExecFrame::StdinEof).await;
+                            data_open = false;
+                        },
+                    }
+                },
+            }
+        }
+        let _ = writer.close().await;
+    });
+
     let mut decoder = EventDecoder::new();
     let mut serve_log = ServeLog::default();
     let mut report: Option<ExitReport> = None;
     let mut serve_status: Option<u32> = None;
     let mut input_open = true;
+    // The stdin data lane; set to None on EOF so the forwarder drains its
+    // backlog first and then sends StdinEof - in order behind the data.
+    let mut data_lane = Some(data_tx);
+    let sig_lane = sig_tx;
 
     'outer: loop {
         enum Sel {
@@ -148,13 +204,19 @@ pub async fn execute(
         };
         match sel {
             Sel::In(Some(InputEvent::Stdin(d))) => {
-                send_frame(&writer, &ExecFrame::StdinData(d)).await?;
+                if let Some(tx) = data_lane.as_ref()
+                    && tx.try_send(d).is_err()
+                {
+                    warn!("stdin backlog full, dropping stdin data");
+                }
             },
             Sel::In(Some(InputEvent::StdinEof)) => {
-                send_frame(&writer, &ExecFrame::StdinEof).await?;
+                data_lane = None;
             },
             Sel::In(Some(InputEvent::Signal(s))) => {
-                send_frame(&writer, &ExecFrame::Signal(s)).await?;
+                if sig_lane.try_send(s).is_err() {
+                    warn!("signal lane full, dropping {} signal", s.as_str());
+                }
             },
             Sel::In(None) => input_open = false,
             Sel::Msg(None | Some(ChanEvent::Closed)) => break,
@@ -182,7 +244,12 @@ pub async fn execute(
 
     reader_task.abort();
     serve_log.flush();
-    let _ = writer.close().await;
+    // Both lanes dropped: the forwarder drains its backlog, closes the write
+    // half and exits. Bounded - serve is on its way out once an Exit frame
+    // was seen or the channel closed, so a stalled window clears quickly.
+    drop(data_lane);
+    drop(sig_lane);
+    let _ = forwarder.await;
 
     match report {
         Some(rep) => Ok(ExecOutcome {
