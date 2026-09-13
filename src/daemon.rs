@@ -336,14 +336,23 @@ fn abbreviate(s: &str) -> String {
 }
 
 /// Get a live connection for `host`, connecting (or reconnecting) as needed.
+///
+/// The map lock is never held across the connect: a slow or timing-out
+/// connect to one host must not block commands to already-connected hosts.
+/// On a connect race the losing connection is dropped; the winner's state
+/// stays in the map.
 async fn get_or_connect(shared: &Arc<Shared>, host: &str) -> Result<Arc<HostState>> {
-    let mut hosts = shared.hosts.lock().await;
-    if let Some(state) = hosts.get(host)
-        && !state.conn.is_closed()
-    {
-        return Ok(Arc::clone(state));
+    let live = |hosts: &HashMap<String, Arc<HostState>>| {
+        hosts.get(host).filter(|s| !s.conn.is_closed()).cloned()
+    };
+    if let Some(state) = live(&*shared.hosts.lock().await) {
+        return Ok(state);
     }
     let state = connect_state(host).await?;
+    let mut hosts = shared.hosts.lock().await;
+    if let Some(existing) = live(&hosts) {
+        return Ok(existing); // another task connected first; keep the winner
+    }
     hosts.insert(host.to_owned(), Arc::clone(&state));
     Ok(state)
 }
