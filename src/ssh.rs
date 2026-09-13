@@ -146,13 +146,14 @@ pub async fn connect(resolved: ResolvedHost) -> Result<SshConnection> {
             .map_err(map_connect_err)?
     } else {
         let addr = (resolved.hostname.as_str(), resolved.port);
-        let tcp = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| Error::Connect(format!("connect to {addr:?} timed out")))?
-        .map_err(|e| Error::Connect(format!("connect to {addr:?}: {e}")))?;
+        // ssh config ConnectTimeout when set, otherwise a library default.
+        let timeout = resolved
+            .connect_timeout
+            .unwrap_or(std::time::Duration::from_secs(15));
+        let tcp = tokio::time::timeout(timeout, TcpStream::connect(&addr))
+            .await
+            .map_err(|_| Error::Connect(format!("connect to {addr:?} timed out")))?
+            .map_err(|e| Error::Connect(format!("connect to {addr:?}: {e}")))?;
         client::connect_stream(config, tcp, handler)
             .await
             .map_err(map_connect_err)?

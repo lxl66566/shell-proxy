@@ -3,7 +3,7 @@
 //! We reuse the OpenSSH client to parse `~/.ssh/config` (aliases, ProxyCommand,
 //! ProxyJump, IdentityFile, UserKnownHostsFile) instead of reimplementing it.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use tokio::process::Command;
 
@@ -22,6 +22,8 @@ pub struct ResolvedHost {
     pub known_hosts_files: Vec<PathBuf>,
     /// ProxyCommand with %h/%p already expanded; None for direct connections.
     pub proxy_command: Option<String>,
+    /// `connecttimeout` seconds (0/unset = library default); TCP only.
+    pub connect_timeout: Option<Duration>,
     /// `stricthostkeychecking` value: unknown keys are rejected unless this
     /// is `no`/`off`/`accept-new`.
     pub strict_host_keys: bool,
@@ -50,6 +52,7 @@ fn fallback(host: &str) -> ResolvedHost {
         identity_files: default_identity_files(),
         known_hosts_files: vec![home_ssh().join("known_hosts")],
         proxy_command: None,
+        connect_timeout: None,
         strict_host_keys: true,
     }
 }
@@ -104,6 +107,7 @@ fn parse_ssh_g_output(host: &str, text: &str) -> Result<ResolvedHost> {
     let mut known_hosts_files = Vec::new();
     let mut proxy_command = None;
     let mut proxy_jump = None;
+    let mut connect_timeout = None;
 
     let mut strict_host_keys = true;
 
@@ -115,6 +119,14 @@ fn parse_ssh_g_output(host: &str, text: &str) -> Result<ResolvedHost> {
             "hostname" => hostname = Some(unquote(value)),
             "port" => port = value.parse().unwrap_or(22),
             "user" => user = Some(unquote(value)),
+            // 0 means "system default" in ssh, which we map to our own default
+            "connecttimeout" => {
+                connect_timeout = value
+                    .parse()
+                    .ok()
+                    .filter(|secs: &u64| *secs > 0)
+                    .map(Duration::from_secs);
+            },
             "identityfile" => identity_files.push(PathBuf::from(expand_tilde(&unquote(value)))),
             // userknownhostsfile carries several paths on one line
             "userknownhostsfile" => known_hosts_files.extend(
@@ -182,6 +194,7 @@ fn parse_ssh_g_output(host: &str, text: &str) -> Result<ResolvedHost> {
         identity_files,
         known_hosts_files,
         proxy_command,
+        connect_timeout,
         strict_host_keys,
     })
 }
@@ -288,6 +301,26 @@ identityfile \"C:/a b/id_ed25519\"
             Some("ssh -W [ex ample.com]:2222 bastion")
         );
         assert_eq!(r.identity_files[0], PathBuf::from("C:/a b/id_ed25519"));
+    }
+
+    #[test]
+    fn parse_connecttimeout() {
+        let mk = |text: &str| format!("host x\nhostname h\nconnecttimeout {text}\n");
+        assert_eq!(
+            parse_ssh_g_output("x", &mk("10")).unwrap().connect_timeout,
+            Some(Duration::from_secs(10))
+        );
+        // 0 = system default in ssh, mapped to our own default
+        assert_eq!(
+            parse_ssh_g_output("x", &mk("0")).unwrap().connect_timeout,
+            None
+        );
+        assert_eq!(
+            parse_ssh_g_output("x", &mk("junk"))
+                .unwrap()
+                .connect_timeout,
+            None
+        );
     }
 
     #[test]
