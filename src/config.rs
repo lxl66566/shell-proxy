@@ -11,21 +11,34 @@ pub const ENV_SOCK: &str = "SP_SOCK";
 /// Env var overriding the default host.
 pub const ENV_HOST: &str = "SP_HOST";
 
+/// Daemon log level; invalid values fail config parsing instead of silently
+/// falling back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
 /// User configuration loaded from `config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Default remote host alias (resolved through the system ssh config).
     pub host: Option<String>,
-    /// Daemon log level: trace/debug/info/warn/error.
-    pub log_level: String,
+    /// Daemon log level.
+    pub log_level: LogLevel,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             host: None,
-            log_level: "info".into(),
+            log_level: LogLevel::Info,
         }
     }
 }

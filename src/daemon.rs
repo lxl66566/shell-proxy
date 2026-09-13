@@ -377,9 +377,8 @@ fn init_logger() -> std::io::Result<()> {
         .path(&path)
         .build()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let level = config::load_config().map_or(LevelFilter::MoreSevere(Level::Info), |c| {
-        parse_level(&c.log_level)
-    });
+    let level =
+        config::load_config().map_or(LevelFilter::MoreSevere(Level::Info), |c| c.log_level.into());
     let logger = Logger::builder()
         .sink(Arc::new(sink))
         .level_filter(level)
@@ -391,12 +390,14 @@ fn init_logger() -> std::io::Result<()> {
     Ok(())
 }
 
-fn parse_level(s: &str) -> LevelFilter {
-    match s.to_ascii_lowercase().as_str() {
-        "trace" => LevelFilter::All,
-        "debug" => LevelFilter::MoreVerboseEqual(Level::Debug),
-        "warn" => LevelFilter::MoreSevereEqual(Level::Warn),
-        "error" => LevelFilter::MoreSevereEqual(Level::Error),
-        _ => LevelFilter::MoreSevereEqual(Level::Info),
+impl From<config::LogLevel> for LevelFilter {
+    fn from(level: config::LogLevel) -> Self {
+        match level {
+            config::LogLevel::Trace => LevelFilter::All,
+            config::LogLevel::Debug => LevelFilter::MoreVerboseEqual(Level::Debug),
+            config::LogLevel::Info => LevelFilter::MoreSevereEqual(Level::Info),
+            config::LogLevel::Warn => LevelFilter::MoreSevereEqual(Level::Warn),
+            config::LogLevel::Error => LevelFilter::MoreSevereEqual(Level::Error),
+        }
     }
 }
