@@ -75,6 +75,25 @@ impl ServerHandler for SpMcp {
     }
 }
 
+/// Each captured stream is capped at this size in the tool result; the MCP
+/// client is not the place to relay gigabytes.
+const MAX_TOOL_OUTPUT: usize = 64 * 1024;
+
+/// Render one stream, truncating with a notice beyond the cap. Cutting inside
+/// a UTF-8 sequence only costs one replacement character at the boundary.
+fn clip(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    if bytes.len() <= MAX_TOOL_OUTPUT {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut s = String::from_utf8_lossy(&bytes[..MAX_TOOL_OUTPUT]).into_owned();
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+    let _ = writeln!(s, "...[truncated, {} bytes total]", bytes.len());
+    s
+}
+
 fn format_report(report: &RunReport, stdout: &[u8], stderr: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -89,13 +108,13 @@ fn format_report(report: &RunReport, stdout: &[u8], stderr: &[u8]) -> String {
         let _ = writeln!(out, "timed_out: true");
     }
     let _ = writeln!(out, "--- stdout ---");
-    out.push_str(&String::from_utf8_lossy(stdout));
-    if !stdout.is_empty() && !stdout.ends_with(b"\n") {
+    out.push_str(&clip(stdout));
+    if !stdout.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
     let _ = writeln!(out, "--- stderr ---");
-    out.push_str(&String::from_utf8_lossy(stderr));
-    if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+    out.push_str(&clip(stderr));
+    if !stderr.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
     out
