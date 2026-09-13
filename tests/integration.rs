@@ -161,7 +161,7 @@ async fn pipes_and_quotes() {
         .await
         .unwrap();
     assert_eq!(rep.code, 0);
-    assert_eq!(out_str(&out), "a");
+    assert_eq!(out_str(&out), "a\n");
     let (rep2, out2, _) = run("echo \"it's 'quoted'\"", None, None).await.unwrap();
     assert_eq!(rep2.code, 0);
     assert_eq!(out_str(&out2), "it's 'quoted'\n");

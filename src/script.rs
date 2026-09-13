@@ -19,6 +19,8 @@
 pub const MARKER_PREFIX: &str = "\x1cSPM:";
 /// Marker terminator.
 pub const MARKER_SUFFIX: &str = "\x1c";
+/// Control message prefix for the wrapper's process group id report.
+pub const PGID_PREFIX: &str = "\x1cSPPG:";
 
 /// Inputs for building one remote wrapper script.
 #[derive(Debug, Clone)]
@@ -69,6 +71,22 @@ pub fn build(spec: &ScriptSpec<'_>) -> String {
             .collect();
         let _ = writeln!(inner, "set -- {}", args.join(" "));
     }
+    // The user command runs in THIS shell (foreground): `sp cd ...` must
+    // mutate the persisted cwd, which the epilogue marker reports.
+    // Report the process group id first: SSH signal requests only reach the
+    // session leader (whose handling interactive bash defers), so the daemon
+    // kills the whole group through a dedicated `kill -SIG -PGID` channel.
+    // The pgid cannot be derived from $$: the login shell (e.g. fish) may not
+    // exec our bash, making the group leader its own pid, not ours.
+    // The control message is stripped by the daemon-side marker filter.
+    inner.push_str("IFS=' ' read -r _ _ _ __sp_pgid _ < /proc/self/stat 2>/dev/null || \
+                    __sp_pgid=$$\n");
+    let _ = writeln!(inner, "printf '\\034SPPG:{nonce}:%s\\034' \"$__sp_pgid\"");
+    // The group INT also hits this bash; without the trap its exit status
+    // after an aborted foreground child is 1, not the expected 128+signum.
+    let _ = writeln!(inner, "trap 'exit 130' INT");
+    let _ = writeln!(inner, "trap 'exit 143' TERM");
+    let _ = writeln!(inner, "trap 'exit 129' HUP");
     inner.push_str(spec.command);
     inner.push('\n');
     // Capture rc before anything else runs; the marker goes to stdout and is
@@ -112,13 +130,25 @@ mod tests {
     fn build_contains_all_layers() {
         let s = build(&spec("echo 'hi'"));
         assert!(s.starts_with("rm -f -- \"$0\""));
-        // inner is sq-escaped once for the -c argument
-        assert!(s.contains("-i -c 'echo '\\''hi'\\''\n"));
+        // inner is sq-escaped once for the -c argument; pgid control message
+        // (read from /proc, $$ may differ from the pgid) precedes the user
+        // command, which runs in this shell (foreground)
+        assert!(s.contains("__sp_pgid _ < /proc/self/stat 2>/dev/null"));
+        assert!(s.contains(
+            r#"printf '\''\034SPPG:ab12:%s\034'\'' "$__sp_pgid""#
+        ));
+        // anchor the exit status for group-killed signals (quotes arrive
+        // sq-escaped for the -c embedding)
+        assert!(s.contains("trap '\\''exit 130'\\'' INT"));
+        assert!(s.contains("trap '\\''exit 143'\\'' TERM"));
+        assert!(s.contains("trap '\\''exit 129'\\'' HUP"));
+        // the user command follows the traps in the same shell
+        assert!(s.contains("exit 129'\\'' HUP\necho '\\''hi'\\''"));
         assert!(s.contains("4>&2 3<<'__SP_ab12__' 2>/dev/null"));
         assert!(s.contains(". /etc/bash.bashrc"));
         assert!(s.contains(". ~/.bashrc"));
         assert!(s.ends_with("__SP_ab12__\n"));
-        // marker printf, escaped for the -c embedding
+        // cwd marker printf, escaped for the -c embedding
         assert!(s.contains(r"printf '\''\034SPM:ab12:%s\034'\''"));
         assert!(s.contains("exec 2>/dev/null\nexit $__sp_rc\n' 4>&2"));
     }

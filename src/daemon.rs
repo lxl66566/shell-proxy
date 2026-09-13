@@ -76,10 +76,7 @@ pub async fn run() -> Result<()> {
                 let stream = res
                     .map_err(|e| Error::Daemon(format!("accept on {sock_path}: {e}")))?;
                 let shared = Arc::clone(&shared);
-                let guard = ActiveGuard {
-                    active: Arc::clone(&active),
-                    idle_now: Arc::clone(&idle_now),
-                };
+                let guard = ActiveGuard::acquire(&active, &idle_now);
                 tokio::spawn(async move {
                     let _guard = guard;
                     if let Err(e) = handle_conn(stream, shared).await {
@@ -98,10 +95,25 @@ pub async fn run() -> Result<()> {
     }
 }
 
-/// Decrements the active-connection counter; wakes the accept loop when idle.
+/// Counts one live connection; the last drop wakes the accept loop so the
+/// idle timer can re-arm. Increment/decrement must stay paired, otherwise
+/// the counter underflows and the daemon never idles out.
 struct ActiveGuard {
     active: Arc<std::sync::atomic::AtomicUsize>,
     idle_now: Arc<tokio::sync::Notify>,
+}
+
+impl ActiveGuard {
+    fn acquire(
+        active: &Arc<std::sync::atomic::AtomicUsize>,
+        idle_now: &Arc<tokio::sync::Notify>,
+    ) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        Self {
+            active: Arc::clone(active),
+            idle_now: Arc::clone(idle_now),
+        }
+    }
 }
 
 impl Drop for ActiveGuard {
@@ -238,6 +250,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
                         let _ = input_tx.send(InputEvent::StdinEof).await;
                     }
                     Ok(Some(ipc::ClientFrame::Signal(s))) => {
+                        info!("forwarding signal {s:?} to engine");
                         let _ = input_tx.send(InputEvent::Signal(s)).await;
                     }
                     Ok(Some(ipc::ClientFrame::Ping)) => {

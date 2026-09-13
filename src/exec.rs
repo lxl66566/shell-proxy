@@ -52,6 +52,10 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// Exit code used when the remote side closed without reporting a status.
 const NO_STATUS_CODE: i32 = 255;
 
+/// Exit code reported for timed-out commands, matching timeout(1), regardless
+/// of how the remote side actually died (KILL would surface as 137).
+const TIMEOUT_EXIT_CODE: i32 = 124;
+
 /// Internal events produced by the channel reader task.
 enum ChanEvent {
     Stdout(Vec<u8>),
@@ -121,6 +125,7 @@ pub async fn execute(
     let mut timed_out = false;
     let mut input_open = true;
     let mut drain_at: Option<Instant> = None;
+    let mut pgid: Option<u32> = None;
     let deadline = timeout.map(|t| Instant::now() + t);
 
     loop {
@@ -146,6 +151,12 @@ pub async fn execute(
             },
             Sel::Msg(Some(ChanEvent::Stdout(d))) => {
                 let passthrough = marker_filter.push(&d);
+                if pgid.is_none() {
+                    pgid = marker_filter.pgid();
+                    if let Some(p) = pgid {
+                        spdlog::info!("captured remote pgid={p}");
+                    }
+                }
                 if !passthrough.is_empty() {
                     let _ = output.send(OutputEvent::Stdout(passthrough)).await;
                 }
@@ -178,16 +189,30 @@ pub async fn execute(
             },
             Sel::In(Some(InputEvent::StdinEof)) => {
                 let _ = writer.eof().await;
-                input_open = false;
+                // stdin is done, but signals may still arrive: only a closed
+                // channel (`Sel::In(None)`) disables this branch.
             },
             Sel::In(Some(InputEvent::Signal(s))) => {
-                let _ = writer.signal(map_signal(s)).await;
+                let (sig, name) = signal_spec(s);
+                if let Some(p) = pgid {
+                    // SSH signal requests only reach the session leader,
+                    // whose handling interactive bash defers: kill the whole
+                    // process group through a dedicated channel instead.
+                    kill_group(handle, p, name).await;
+                } else {
+                    let _ = writer.signal(sig).await;
+                }
             },
             Sel::In(None) => input_open = false,
             Sel::Drain => break,
             Sel::Timeout => {
                 timed_out = true;
-                let _ = writer.signal(Sig::KILL).await;
+                match pgid {
+                    Some(p) => kill_group(handle, p, "KILL").await,
+                    None => {
+                        let _ = writer.signal(Sig::KILL).await;
+                    },
+                }
                 drain_at = Some(Instant::now() + DRAIN_GRACE);
             },
         }
@@ -202,7 +227,11 @@ pub async fn execute(
     }
 
     Ok(ExecOutcome {
-        exit_code: exit.unwrap_or(NO_STATUS_CODE),
+        exit_code: if timed_out {
+            TIMEOUT_EXIT_CODE
+        } else {
+            exit.unwrap_or(NO_STATUS_CODE)
+        },
         new_cwd,
         timed_out,
     })
@@ -246,13 +275,49 @@ async fn upload_script(handle: &SshHandle, script_text: String, nonce_hex: &str)
     Ok(())
 }
 
-fn map_signal(s: Signal) -> Sig {
+/// russh signal value plus the `kill(1)` name for the same signal.
+fn signal_spec(s: Signal) -> (Sig, &'static str) {
     match s {
-        Signal::Int => Sig::INT,
-        Signal::Term => Sig::TERM,
-        Signal::Kill => Sig::KILL,
-        Signal::Hup => Sig::HUP,
+        Signal::Int => (Sig::INT, "INT"),
+        Signal::Term => (Sig::TERM, "TERM"),
+        Signal::Kill => (Sig::KILL, "KILL"),
+        Signal::Hup => (Sig::HUP, "HUP"),
     }
+}
+
+/// Kill the remote process group through a dedicated exec channel. Failures
+/// are logged but otherwise ignored: the command may already have exited.
+async fn kill_group(handle: &SshHandle, pgid: u32, name: &str) {
+    let Ok(mut channel) = handle.channel_open_session().await else {
+        spdlog::warn!("group-kill: open channel failed");
+        return;
+    };
+    // Diagnostics: rc of kill plus the group membership at signal time. The
+    // command goes through bash explicitly: the login shell may be anything
+    // (e.g. fish, which rejects `;`-chained POSIX syntax).
+    let cmd = format!(
+        "bash -c 'kill -{name} -{pgid}; echo kill_rc=$?; \
+         ps -o pid,ppid,pgid,sid,comm -g {pgid} 2>&1'"
+    );
+    // want_reply=true: await the server's acceptance before reading/closing.
+    if let Err(e) = channel.exec(true, cmd).await {
+        spdlog::warn!("group-kill exec failed: {e}");
+        return;
+    }
+    let mut out = Vec::new();
+    let mut code: Option<u32> = None;
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::Data { data } => out.extend_from_slice(&data),
+            ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
+            ChannelMsg::Close => break,
+            _ => {},
+        }
+    }
+    let _ = channel.close().await;
+    let text = String::from_utf8_lossy(&out);
+    let text = text.replace('\n', " | ");
+    spdlog::info!("group-kill {name} -{pgid}: status={code:?} out={text}");
 }
 
 /// Map an SSH exit-signal to a shell-style 128+signum exit code.
