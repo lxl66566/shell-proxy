@@ -367,3 +367,94 @@ async fn cli_exit_code_passthrough() {
     assert_eq!(out2.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out2.stdout), "cli-hello\n");
 }
+
+#[tokio::test]
+async fn cli_quoted_line_runs_as_command_line() {
+    let Some(_g) = guard().await else { return };
+    // One argument carrying shell syntax must reach bash verbatim, not as a
+    // single quoted command name.
+    let out = Command::new(env!("CARGO_BIN_EXE_sp"))
+        .args(["--host", &harness().host, "echo 333 | grep 3"])
+        .output()
+        .expect("run sp");
+    assert_eq!(out.status.code(), Some(0), "{}", out_str(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "333\n");
+}
+
+#[tokio::test]
+async fn push_pull_roundtrip() {
+    let Some(_g) = guard().await else { return };
+    // Binary + UTF-8 payload: both directions must be byte-exact.
+    let mut payload = b"line-one\n\x00\xff\x01binary\n".to_vec();
+    payload.extend_from_slice("你好，世界\n".as_bytes());
+    let remote = format!("/tmp/sp-push-test-{}", std::process::id());
+    let up = client::upload_request(harness().host.clone(), &remote, None, None);
+    let (_tx, rx) = mpsc::channel(1);
+    let (rep, ..) = client::run_captured(up, payload.clone(), rx).await.unwrap();
+    assert_eq!(rep.code, 0, "push must succeed");
+    let down = client::download_request(harness().host.clone(), &remote, None, None);
+    let (_tx, rx) = mpsc::channel(1);
+    let (rep2, out, _) = client::run_captured(down, Vec::new(), rx).await.unwrap();
+    assert_eq!(rep2.code, 0);
+    assert_eq!(out, payload);
+    run(&format!("rm -f {remote}"), None, None).await.unwrap();
+}
+
+#[tokio::test]
+async fn push_to_missing_dir_reports_error() {
+    let Some(_g) = guard().await else { return };
+    let remote = format!("/nonexistent-sp-test-{}/f", std::process::id());
+    let up = client::upload_request(harness().host.clone(), &remote, None, None);
+    let (_tx, rx) = mpsc::channel(1);
+    let (rep, _, err) = client::run_captured(up, b"x".to_vec(), rx).await.unwrap();
+    assert_ne!(rep.code, 0);
+    assert!(out_str(&err).contains("No such file"));
+}
+
+#[tokio::test]
+async fn cli_push_pull_files() {
+    let Some(_g) = guard().await else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let payload = b"cli \x00\xff roundtrip\n".to_vec();
+    let local = dir.path().join("payload.bin");
+    std::fs::write(&local, &payload).unwrap();
+    let remote = format!("/tmp/sp-cli-push-{}", std::process::id());
+    let st = Command::new(env!("CARGO_BIN_EXE_sp"))
+        .args([
+            "--host",
+            &harness().host,
+            "push",
+            &local.to_string_lossy(),
+            &remote,
+        ])
+        .output()
+        .expect("run sp");
+    assert_eq!(st.status.code(), Some(0), "{}", out_str(&st.stderr));
+    let back = dir.path().join("back.bin");
+    let st2 = Command::new(env!("CARGO_BIN_EXE_sp"))
+        .args([
+            "--host",
+            &harness().host,
+            "pull",
+            &remote,
+            &back.to_string_lossy(),
+        ])
+        .output()
+        .expect("run sp");
+    assert_eq!(st2.status.code(), Some(0), "{}", out_str(&st2.stderr));
+    assert_eq!(std::fs::read(&back).unwrap(), payload);
+    run(&format!("rm -f {remote}"), None, None).await.unwrap();
+}
+
+#[tokio::test]
+async fn cli_doctor_reports_remote() {
+    let Some(_g) = guard().await else { return };
+    let out = Command::new(env!("CARGO_BIN_EXE_sp"))
+        .args(["--host", &harness().host, "doctor"])
+        .output()
+        .expect("run sp");
+    assert_eq!(out.status.code(), Some(0), "{}", out_str(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("os: Linux"), "doctor output: {text}");
+    assert!(text.contains("bash:"), "doctor output: {text}");
+}

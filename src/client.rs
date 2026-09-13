@@ -309,3 +309,94 @@ pub fn read_script_file(path: &Path) -> Result<String> {
     String::from_utf8(bytes)
         .map_err(|e| Error::Config(format!("{} is not valid UTF-8: {e}", path.display())))
 }
+
+/// Quote `s` so bash parses it back as one word. Conservative safe set: only
+/// unambiguous everyday characters stay bare, everything else is single-quoted
+/// with the standard `'\''` escape.
+#[must_use]
+pub fn shell_quote(s: &str) -> String {
+    if is_bare_word(s) {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// Whether `s` passes through [`shell_quote`] unquoted: a non-empty run of
+/// characters that are unambiguous inside one bash word.
+#[must_use]
+pub fn is_bare_word(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(bare_char)
+}
+
+fn bare_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '_' | '-' | '.' | '/' | '=' | ':' | ',' | '%' | '@' | '+')
+}
+
+/// Request that streams forwarded stdin into a remote file (`cat >`,
+/// truncates). The remote `cat` writes no stdout; its stderr and exit code
+/// carry any failure (missing parent directory, permissions).
+#[must_use]
+pub fn upload_request(
+    host: String,
+    remote: &str,
+    cwd: Option<String>,
+    timeout_ms: Option<u64>,
+) -> ExecRequest {
+    ExecRequest {
+        host,
+        command: format!("cat > {}", shell_quote(remote)),
+        args: Vec::new(),
+        cwd,
+        timeout_ms,
+    }
+}
+
+/// Request that streams a remote file to captured stdout (`cat`).
+#[must_use]
+pub fn download_request(
+    host: String,
+    remote: &str,
+    cwd: Option<String>,
+    timeout_ms: Option<u64>,
+) -> ExecRequest {
+    ExecRequest {
+        host,
+        command: format!("cat {}", shell_quote(remote)),
+        args: Vec::new(),
+        cwd,
+        timeout_ms,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_bare_word, shell_quote};
+
+    #[test]
+    fn quotes_only_what_needs_it() {
+        assert_eq!(shell_quote("ls"), "ls");
+        assert_eq!(shell_quote("-alF"), "-alF");
+        assert_eq!(shell_quote("/root/x.yml"), "/root/x.yml");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn quotes_embedded_quotes() {
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote("a\"b"), "'a\"b'");
+        assert_eq!(shell_quote("$HOME"), "'$HOME'");
+    }
+
+    #[test]
+    fn bare_word_detection_matches_quoter() {
+        assert!(is_bare_word("ls"));
+        assert!(!is_bare_word(""));
+        assert!(!is_bare_word("echo 1"));
+        assert!(!is_bare_word("a|b"));
+        // A quoted command line always fails the bare test and is run verbatim.
+        assert!(!is_bare_word("cd /tmp && pwd"));
+    }
+}

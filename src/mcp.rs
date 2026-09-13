@@ -1,4 +1,5 @@
-//! MCP server exposing the remote shell as one `exec` tool.
+//! MCP server exposing the remote shell as `exec`, `read_file` and
+//! `write_file` tools.
 
 use anyhow::Result;
 use rmcp::{
@@ -30,6 +31,22 @@ struct ExecParams {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadFileParams {
+    /// Remote path; relative paths resolve against the persisted cwd.
+    path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WriteFileParams {
+    /// Remote path; relative paths resolve against the persisted cwd.
+    path: String,
+    /// UTF-8 file content, written verbatim (truncates).
+    content: String,
+}
+
 #[derive(Clone, Default)]
 struct SpMcp;
 
@@ -39,8 +56,7 @@ impl SpMcp {
         description = "Execute a bash command on the remote Linux host. cwd persists across calls."
     )]
     async fn exec(&self, params: Parameters<ExecParams>) -> Result<CallToolResult, McpError> {
-        let host =
-            config::resolve_host(None).map_err(|e| McpError::internal_error(e.brief(), None))?;
+        let host = resolve_host()?;
         let req = ExecRequest {
             host,
             command: params.0.command,
@@ -48,15 +64,75 @@ impl SpMcp {
             cwd: params.0.cwd,
             timeout_ms: Some(params.0.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
         };
-        let (signals_tx, signals_rx) = mpsc::channel(1);
-        drop(signals_tx);
-        let (report, stdout, stderr) = client::run_captured(req, Vec::new(), signals_rx)
-            .await
-            .map_err(|e| McpError::internal_error(e.brief(), None))?;
+        let (report, stdout, stderr) = call(req, Vec::new()).await?;
         Ok(CallToolResult::success(vec![ContentBlock::text(
             format_report(&report, &stdout, &stderr),
         )]))
     }
+
+    #[tool(description = "Read a remote file (UTF-8 text).")]
+    async fn read_file(
+        &self,
+        params: Parameters<ReadFileParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let host = resolve_host()?;
+        let req = client::download_request(host, &params.0.path, None, Some(DEFAULT_TIMEOUT_MS));
+        let (report, stdout, stderr) = call(req, Vec::new()).await?;
+        match file_result(&report, &stdout, &stderr) {
+            Some(err) => Ok(CallToolResult::error(vec![ContentBlock::text(err)])),
+            None => Ok(CallToolResult::success(vec![ContentBlock::text(clip(
+                &stdout,
+            ))])),
+        }
+    }
+
+    #[tool(description = "Write UTF-8 text to a remote file (truncates).")]
+    async fn write_file(
+        &self,
+        params: Parameters<WriteFileParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let host = resolve_host()?;
+        let req = client::upload_request(host, &params.0.path, None, Some(DEFAULT_TIMEOUT_MS));
+        let content = params.0.content;
+        let len = content.len();
+        let (report, _, stderr) = call(req, content.into_bytes()).await?;
+        match file_result(&report, b"", &stderr) {
+            Some(err) => Ok(CallToolResult::error(vec![ContentBlock::text(err)])),
+            None => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "wrote {} ({len} bytes)",
+                params.0.path
+            ))])),
+        }
+    }
+}
+
+fn resolve_host() -> Result<String, McpError> {
+    config::resolve_host(None).map_err(|e| McpError::internal_error(e.brief(), None))
+}
+
+/// Run one request with captured streams; no signal forwarding (MCP has no
+/// console to interrupt from).
+async fn call(req: ExecRequest, stdin: Vec<u8>) -> Result<(RunReport, Vec<u8>, Vec<u8>), McpError> {
+    let (signals_tx, signals_rx) = mpsc::channel(1);
+    drop(signals_tx);
+    client::run_captured(req, stdin, signals_rx)
+        .await
+        .map_err(|e| McpError::internal_error(e.brief(), None))
+}
+
+/// Failure rendering shared by the file tools: `None` means success.
+fn file_result(report: &RunReport, stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    if let Some(e) = &report.error {
+        return Some(format!("error: {e}"));
+    }
+    (report.code != 0).then(|| {
+        format!(
+            "exit_code: {}\n--- stdout ---\n{}--- stderr ---\n{}",
+            report.code,
+            clip(stdout),
+            clip(stderr)
+        )
+    })
 }
 
 // The `tool_handler` macro generates an async `call` without awaits.

@@ -7,7 +7,8 @@
 - Ctrl+C 转发为远端进程组 SIGINT，本地拿到真实的 130 退出码
 - **cwd 在多次调用之间保持**（`sp cd /root` 后，下一条命令仍在 /root）
 - 远端以交互式 bash 运行，加载 `~/.bashrc`（alias、函数可用）
-- 支持作为 MCP server 提供给 AI Agent
+- 文件通道：`sp push` / `sp pull`（二进制安全，`-` 表示 stdin/stdout）
+- 支持作为 MCP server 提供给 AI Agent（exec / read_file / write_file）
 
 ## 架构
 
@@ -58,23 +59,32 @@ sp gcc -o t t.c                # Ctrl+C 会转发到远端，本地拿到真实�
 sp --timeout 60 make           # 超时先向远端进程组发 TERM，5 秒后 KILL，退出码 124
 sp -f deploy.sh                # 执行本地脚本文件（多行 bash）
 sp -f run.sh -- arg1 "arg 2"   # 位置参数 -> 脚本内 $1 $2
+sp push patch.py /tmp/x.py     # 上传文件（二进制安全；local 为 `-` 时读 stdin）
+sp pull /etc/os-release -      # 下载文件（local 为 `-` 时写 stdout）
+sp doctor                      # 诊断本地/daemon/远端环境
 sp status                      # daemon 存活状态
 sp daemon                      # 手动前台运行 daemon（通常无需，会自动拉起）
 ```
 
-命令行参数拼接规则：单参数原样执行；多参数按 shell 规则逐个引用后以空格连接（`sp echo "a b"` 在远端仍是一个参数）。复杂命令建议整体加引号，或用 `-f` 文件执行（本地 shell 不需要能理解该命令）。
+命令行参数拼接规则：
+
+- **单个参数且含 shell 语法**（空格、`|`、`&&` 等）：整条作为命令行原文交给远端 bash，与 `sp echo 1` 等价——本地 shell 要求你给 `|` `&&` `$` 这些字符加引号，sp 把引号剥掉后的原文直接执行。
+- **多个参数**：逐个按 shell 规则引用后以空格连接，词边界不丢（`sp echo "a b"` 在远端仍是一个参数）。
+- 复杂脚本用 `-f` 文件执行（本地 shell 不需要能理解该命令），或 `cat script.sh | sp` 从 stdin 读入。
+
+`push` / `pull` 的远端路径相对持久 cwd 解析；写端截断覆盖，父目录不存在时远端 `cat` 的报错原样透传。
 
 退出码约定：远端命令退出码原样返回；超时 124（同 `timeout(1)`）；daemon/连接类错误 254。
 
 ## MCP
 
-`sp mcp` 在 stdio 上提供 MCP server，暴露一个工具：
+`sp mcp` 在 stdio 上提供 MCP server，暴露三个工具：
 
-```json
-{ "command": "echo hi", "cwd": "/tmp", "timeout_ms": 30000 }
-```
+- `exec`：`{ "command": "echo hi", "cwd": "/tmp", "timeout_ms": 30000 }`，返回 `exit_code`、`cwd`、`--- stdout ---`、`--- stderr ---`；cwd 在多次调用间保持。
+- `read_file`：`{ "path": "/tmp/x.py" }`，返回远端文件内容（UTF-8 文本）。
+- `write_file`：`{ "path": "/tmp/x.py", "content": "..." }`，写入远端文件（截断覆盖）。
 
-返回 `exit_code`、`cwd`、`--- stdout ---`、`--- stderr ---`；cwd 在多次调用间保持。
+命令是结构化字符串，直接到达远端 bash 原文执行，没有本地 shell 引号问题；文件工具免去 base64 搬运。
 
 配置示例（客户端 stdio 方式）：
 
@@ -105,7 +115,8 @@ daemon 日志位于 `<config_dir>/shell-proxy/logs/daemon.log`（超过 10MB 启
 - 远端架构暂支持 x86_64 / aarch64 Linux（musl 静态二进制）；远端需要 PATH 中有 `bash`。
 - 终端（tty）stdin 不转发（无 TUI 支持）；管道 stdin 正常。
 - 远端后台进程（`sleep 100 &`）在命令结束后继续运行，但其后续输出不再转发（与本地 `&` 后退出终端的行为类似），且会阻止本次调用的 cwd 更新。
-- `-f` 脚本与命令必须是 UTF-8。
+- `-f` 脚本与命令必须是 UTF-8；`write_file` / `read_file` 同样只处理 UTF-8 文本（二进制用 `push` / `pull`）。
+- `push` / `pull` 只传单个文件，不递归目录（目录可用 `tar c ... | sp "tar x -C ..."`）。
 - 不提供 pty（无 TUI 交互）；`top` 这类全屏程序不适用。
 
 ## 测试

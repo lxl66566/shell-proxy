@@ -4,7 +4,7 @@ use std::{io::IsTerminal, path::PathBuf, process::ExitCode};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use shell_proxy::{
-    client::{self, RunIo},
+    client::{self, RunIo, is_bare_word},
     config, console,
     proto::{self, ExecRequest, Signal},
 };
@@ -16,6 +16,9 @@ const EXIT_INTERNAL: u8 = proto::INTERNAL_ERROR_CODE as u8;
 /// Exit code for timed-out commands, matching timeout(1).
 #[allow(clippy::cast_possible_truncation)]
 const EXIT_TIMEOUT: u8 = proto::TIMEOUT_EXIT_CODE as u8;
+
+/// Timeout (ms) for the `doctor` remote probe.
+const DOCTOR_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +60,22 @@ enum Sub {
     Mcp,
     /// Check whether the daemon is running
     Status,
+    /// Copy a local file to the remote host
+    Push {
+        /// Local path, or "-" to read stdin
+        local: PathBuf,
+        /// Remote path (relative to the persisted cwd), truncated on write
+        remote: String,
+    },
+    /// Copy a remote file to the local machine
+    Pull {
+        /// Remote path (relative to the persisted cwd)
+        remote: String,
+        /// Local path, or "-" to write stdout
+        local: PathBuf,
+    },
+    /// Show local and remote environment diagnostics
+    Doctor,
 }
 
 fn main() -> ExitCode {
@@ -77,7 +96,7 @@ fn main() -> ExitCode {
 async fn async_main() -> ExitCode {
     let cli = Cli::parse();
 
-    match cli.sub {
+    match &cli.sub {
         Some(Sub::Daemon) => match shell_proxy::daemon::run().await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -102,7 +121,21 @@ async fn async_main() -> ExitCode {
                 ExitCode::FAILURE
             },
         },
+        Some(Sub::Push { local, remote }) => run_push(&cli, local, remote).await,
+        Some(Sub::Pull { remote, local }) => run_pull(&cli, remote, local).await,
+        Some(Sub::Doctor) => run_doctor(&cli).await,
         None => run_command(cli).await,
+    }
+}
+
+/// Resolve the host or print the error and bail with the internal exit code.
+fn resolve_host_or_fail(cli: &Cli) -> Option<String> {
+    match config::resolve_host(cli.host.as_deref()) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("sp: {e}");
+            None
+        },
     }
 }
 
@@ -119,12 +152,8 @@ async fn run_command(cli: Cli) -> ExitCode {
         },
     };
 
-    let host = match config::resolve_host(cli.host.as_deref()) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("sp: {e}");
-            return ExitCode::from(EXIT_INTERNAL);
-        },
+    let Some(host) = resolve_host_or_fail(&cli) else {
+        return ExitCode::from(EXIT_INTERNAL);
     };
 
     let req = ExecRequest {
@@ -132,11 +161,8 @@ async fn run_command(cli: Cli) -> ExitCode {
         command,
         args,
         cwd: cli.cwd,
-        timeout_ms: cli.timeout.map(|s| s.saturating_mul(1000)),
+        timeout_ms: cli.timeout.map(timeout_ms),
     };
-
-    let (sig_tx, sig_rx) = mpsc::channel::<Signal>(4);
-    console::install(sig_tx);
 
     // A terminal stdin is not forwarded (no TUI support): typing would compete
     // with the console for input and keep a blocking read parked. Piped stdin
@@ -152,6 +178,116 @@ async fn run_command(cli: Cli) -> ExitCode {
         stdout: Box::new(tokio::io::stdout()),
         stderr: Box::new(tokio::io::stderr()),
     };
+    exec_with_console(req, io).await
+}
+
+/// `sp push`: stream a local file (or stdin) into a remote path.
+async fn run_push(cli: &Cli, local: &std::path::Path, remote: &str) -> ExitCode {
+    let Some(host) = resolve_host_or_fail(cli) else {
+        return ExitCode::from(EXIT_INTERNAL);
+    };
+    let stdin: Box<dyn tokio::io::AsyncRead + Send + Unpin> = if local.as_os_str() == "-" {
+        if std::io::stdin().is_terminal() {
+            eprintln!("sp: `-` reads stdin, but stdin is a terminal; pipe data in or name a file");
+            return ExitCode::from(EXIT_INTERNAL);
+        }
+        Box::new(tokio::io::stdin())
+    } else {
+        match tokio::fs::File::open(local).await {
+            Ok(f) => Box::new(f),
+            Err(e) => {
+                eprintln!("sp: open {}: {e}", local.display());
+                return ExitCode::from(EXIT_INTERNAL);
+            },
+        }
+    };
+    let io = RunIo {
+        stdin,
+        stdout: Box::new(tokio::io::stdout()),
+        stderr: Box::new(tokio::io::stderr()),
+    };
+    let req = client::upload_request(host, remote, cli.cwd.clone(), cli.timeout.map(timeout_ms));
+    exec_with_console(req, io).await
+}
+
+/// `sp pull`: stream a remote file to a local path (or stdout).
+async fn run_pull(cli: &Cli, remote: &str, local: &std::path::Path) -> ExitCode {
+    let Some(host) = resolve_host_or_fail(cli) else {
+        return ExitCode::from(EXIT_INTERNAL);
+    };
+    let stdout: Box<dyn tokio::io::AsyncWrite + Send + Unpin> = if local.as_os_str() == "-" {
+        Box::new(tokio::io::stdout())
+    } else {
+        match tokio::fs::File::create(local).await {
+            Ok(f) => Box::new(f),
+            Err(e) => {
+                eprintln!("sp: create {}: {e}", local.display());
+                return ExitCode::from(EXIT_INTERNAL);
+            },
+        }
+    };
+    let io = RunIo {
+        stdin: Box::new(tokio::io::empty()),
+        stdout,
+        stderr: Box::new(tokio::io::stderr()),
+    };
+    let req = client::download_request(host, remote, cli.cwd.clone(), cli.timeout.map(timeout_ms));
+    exec_with_console(req, io).await
+}
+
+/// `sp doctor`: report local setup, daemon state and the remote environment.
+///
+/// The remote probe runs through the normal execution path, so a success
+/// proves the whole chain (config -> daemon -> ssh -> serve -> bash).
+async fn run_doctor(cli: &Cli) -> ExitCode {
+    println!(
+        "sp {} ({} {})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    println!(
+        "config: {}",
+        config::app_dir().join("config.toml").display()
+    );
+
+    let source = if cli.host.is_some() {
+        "--host"
+    } else if std::env::var_os(config::ENV_HOST).is_some_and(|v| !v.is_empty()) {
+        config::ENV_HOST
+    } else {
+        "config.toml"
+    };
+    let Some(host) = resolve_host_or_fail(cli) else {
+        return ExitCode::from(EXIT_INTERNAL);
+    };
+    println!("host: {host} (from {source})");
+
+    match client::ping().await {
+        Ok(pid) => println!("daemon: running (pid {pid})"),
+        Err(_) => println!("daemon: not running (starts on first use)"),
+    }
+
+    let req = ExecRequest {
+        host,
+        command: r#"echo "os: $(uname -srm)"; echo "bash: $(bash --version | head -1)"; echo "home: $HOME"; echo "cwd: $PWD""#.into(),
+        args: Vec::new(),
+        cwd: cli.cwd.clone(),
+        timeout_ms: Some(DOCTOR_TIMEOUT_MS),
+    };
+    let io = RunIo {
+        stdin: Box::new(tokio::io::empty()),
+        stdout: Box::new(tokio::io::stdout()),
+        stderr: Box::new(tokio::io::stderr()),
+    };
+    exec_with_console(req, io).await
+}
+
+/// Run one request with console signal forwarding and map the report to an
+/// exit code, the shared tail of every exec-like subcommand.
+async fn exec_with_console(req: ExecRequest, io: RunIo<'_>) -> ExitCode {
+    let (sig_tx, sig_rx) = mpsc::channel::<Signal>(4);
+    console::install(sig_tx);
 
     match client::run(req, io, sig_rx).await {
         Ok(report) => {
@@ -172,6 +308,10 @@ async fn run_command(cli: Cli) -> ExitCode {
     }
 }
 
+fn timeout_ms(secs: u64) -> u64 {
+    secs.saturating_mul(1000)
+}
+
 /// Build the command text: file mode, positional args, or piped stdin.
 fn build_command(cli: &Cli) -> shell_proxy::Result<Option<(String, Vec<String>)>> {
     let cmd_args = || {
@@ -186,11 +326,18 @@ fn build_command(cli: &Cli) -> shell_proxy::Result<Option<(String, Vec<String>)>
         return Ok(Some((text, cmd_args())));
     }
     if !cli.cmd.is_empty() {
-        // Args arrive shell-dequoted from the local shell; re-quote each one
-        // so the remote bash parses the joined line back into the same words.
+        // A lone argument that is not a bare word carries shell syntax the
+        // local shell made the user quote (`sp "a | b"`): run it verbatim as a
+        // command line, like ssh. Several arguments are words whose boundaries
+        // must survive (`sp grep "a b" f`): re-quote each before joining.
+        if let [only] = cli.cmd.as_slice()
+            && !is_bare_word(&only.to_string_lossy())
+        {
+            return Ok(Some((only.to_string_lossy().into_owned(), Vec::new())));
+        }
         let joined = cmd_args()
             .iter()
-            .map(|s| shell_quote(s))
+            .map(|s| client::shell_quote(s))
             .collect::<Vec<_>>()
             .join(" ");
         return Ok(Some((joined, Vec::new())));
@@ -205,38 +352,50 @@ fn build_command(cli: &Cli) -> shell_proxy::Result<Option<(String, Vec<String>)>
     Ok(None)
 }
 
-/// Quote `s` so bash parses it back as one word. Conservative safe set: only
-/// unambiguous everyday characters stay bare, everything else is single-quoted
-/// with the standard `'\''` escape.
-fn shell_quote(s: &str) -> String {
-    fn bare(c: char) -> bool {
-        c.is_ascii_alphanumeric()
-            || matches!(c, '_' | '-' | '.' | '/' | '=' | ':' | ',' | '%' | '@' | '+')
-    }
-    if !s.is_empty() && s.chars().all(bare) {
-        s.to_owned()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::shell_quote;
+    use std::ffi::OsString;
 
-    #[test]
-    fn quotes_only_what_needs_it() {
-        assert_eq!(shell_quote("ls"), "ls");
-        assert_eq!(shell_quote("-alF"), "-alF");
-        assert_eq!(shell_quote("/root/x.yml"), "/root/x.yml");
-        assert_eq!(shell_quote("a b"), "'a b'");
-        assert_eq!(shell_quote(""), "''");
+    use super::{Cli, build_command};
+
+    fn cli_cmd(args: &[&str]) -> Cli {
+        Cli {
+            host: None,
+            cwd: None,
+            timeout: None,
+            file: None,
+            sub: None,
+            cmd: args.iter().map(OsString::from).collect(),
+        }
+    }
+
+    fn built(args: &[&str]) -> String {
+        build_command(&cli_cmd(args)).unwrap().expect("command").0
     }
 
     #[test]
-    fn quotes_embedded_quotes() {
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
-        assert_eq!(shell_quote("a\"b"), "'a\"b'");
-        assert_eq!(shell_quote("$HOME"), "'$HOME'");
+    fn lone_quoted_line_runs_verbatim() {
+        assert_eq!(built(&["echo 1"]), "echo 1");
+        assert_eq!(built(&["echo 333 | grep 3"]), "echo 333 | grep 3");
+        assert_eq!(built(&["cd /tmp && pwd"]), "cd /tmp && pwd");
+        // Locally quoted operators stay live shell syntax, not literal words.
+        assert_eq!(built(&["ls|wc"]), "ls|wc");
+    }
+
+    #[test]
+    fn multiple_args_keep_word_boundaries() {
+        assert_eq!(built(&["echo", "a b"]), "echo 'a b'");
+        assert_eq!(built(&["grep", "a b", "f.txt"]), "grep 'a b' f.txt");
+        assert_eq!(
+            built(&["bash", "-c", "cd /x && ls"]),
+            "bash -c 'cd /x && ls'"
+        );
+    }
+
+    #[test]
+    fn lone_bare_word_stays_a_word() {
+        assert_eq!(built(&["ls"]), "ls");
+        assert_eq!(built(&["definitely_missing"]), "definitely_missing");
+        assert_eq!(built(&["/root/x.sh"]), "/root/x.sh");
     }
 }
