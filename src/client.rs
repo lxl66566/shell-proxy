@@ -76,7 +76,7 @@ fn daemon_exe() -> Result<PathBuf> {
 /// does not hit it.
 #[cfg(unix)]
 pub fn spawn_daemon() -> Result<()> {
-    use std::os::unix::process::CommandExt;
+    // tokio::process::Command has its own inherent process_group on unix.
     let exe = daemon_exe()?;
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("daemon")

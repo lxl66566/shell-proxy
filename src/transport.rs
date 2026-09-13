@@ -1,5 +1,6 @@
 //! Platform IPC endpoint: named pipe on Windows, unix socket elsewhere.
 
+#[cfg(windows)]
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
