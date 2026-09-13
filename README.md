@@ -55,7 +55,7 @@ sp --cwd /var pwd              # 本次指定起始目录（并成为新的持�
 sp "definitely_missing"        # -> stderr: command not found, 退出码 127
 echo data | sp cat             # stdin 转发（管道）
 sp gcc -o t t.c                # Ctrl+C 会转发到远端，本地拿到 130
-sp --timeout 60 make           # 超时杀掉远端进程组，退出码 124
+sp --timeout 60 make           # 超时先向远端进程组发 TERM，5 秒后 KILL，退出码 124
 sp -f deploy.sh                # 执行本地脚本文件（多行 bash）
 sp -f run.sh -- arg1 "arg 2"   # 位置参数 -> 脚本内 $1 $2
 sp status                      # daemon 存活状态

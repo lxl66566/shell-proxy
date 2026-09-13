@@ -27,6 +27,10 @@ const EXEC_WAIT: Duration = Duration::from_secs(30);
 /// forever. Matches the behavior of the daemon-side implementation.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
+/// Grace between the timeout TERM and the escalating KILL, so remote cleanup
+/// handlers (traps, make/gradle shutdown hooks) get a chance to run.
+const TERM_GRACE: Duration = Duration::from_secs(5);
+
 /// Entry point: returns the process exit code.
 pub async fn run() -> i32 {
     match inner().await {
@@ -180,7 +184,8 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
         .timeout_ms
         .filter(|ms| *ms > 0)
         .map(Duration::from_millis);
-    let deadline = timeout.map(|t| Instant::now() + t);
+    let mut term_deadline = timeout.map(|t| Instant::now() + t);
+    let mut kill_deadline: Option<Instant> = None;
     let far = Instant::now() + Duration::from_secs(86_400 * 365);
     let mut dead_rx = std::pin::pin!(dead_rx);
     let mut wait = std::pin::pin!(child.wait());
@@ -191,7 +196,7 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
         let sel = tokio::select! {
             c = ctrl_rx.recv(), if ctrl_open => Sel::Ctrl(c),
             s = &mut wait => Sel::Exit(s),
-            () = tokio::time::sleep_until(deadline.unwrap_or(far)), if deadline.is_some() && !timed_out => Sel::Timeout,
+            () = tokio::time::sleep_until(kill_deadline.or(term_deadline).unwrap_or(far)), if kill_deadline.is_some() || term_deadline.is_some() => Sel::Timeout,
             d = &mut dead_rx => Sel::Dead(d.is_ok()),
         };
         match sel {
@@ -216,11 +221,21 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
             Sel::Exit(s) => break s.context("wait on child")?,
             Sel::Timeout => {
                 timed_out = true;
-                log(&format!(
-                    "timeout after {}ms, killing pgid {pgid}",
-                    timeout.unwrap_or_default().as_millis()
-                ));
-                kill_group_raw(pgid, libc::SIGKILL);
+                if kill_deadline.is_none() {
+                    // TERM first so traps and cleanup handlers run; escalate to
+                    // KILL after the grace period (like `timeout -k`).
+                    log(&format!(
+                        "timeout after {}ms, sending TERM to pgid {pgid}",
+                        timeout.unwrap_or_default().as_millis()
+                    ));
+                    kill_group(pgid, Signal::Term);
+                    term_deadline = None;
+                    kill_deadline = Some(Instant::now() + TERM_GRACE);
+                } else {
+                    log(&format!("grace elapsed, sending KILL to pgid {pgid}"));
+                    kill_group_raw(pgid, libc::SIGKILL);
+                    kill_deadline = None;
+                }
             },
             Sel::Dead(d) => {
                 if d {
