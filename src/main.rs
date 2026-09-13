@@ -10,9 +10,11 @@ use shell_proxy::{
 };
 use tokio::sync::mpsc;
 
-/// Exit code for daemon/internal errors.
+/// Exit code for daemon/internal errors. Fits u8; pinned by a sp-proto test.
+#[allow(clippy::cast_possible_truncation)]
 const EXIT_INTERNAL: u8 = proto::INTERNAL_ERROR_CODE as u8;
 /// Exit code for timed-out commands, matching timeout(1).
+#[allow(clippy::cast_possible_truncation)]
 const EXIT_TIMEOUT: u8 = proto::TIMEOUT_EXIT_CODE as u8;
 
 #[derive(Parser)]

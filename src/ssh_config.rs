@@ -75,7 +75,7 @@ fn home_ssh() -> PathBuf {
 
 async fn run_ssh_g(host: &str) -> Result<ResolvedHost> {
     let out = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        Duration::from_secs(10),
         Command::new("ssh").arg("-G").arg(host).output(),
     )
     .await

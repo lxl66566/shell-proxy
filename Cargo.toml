@@ -61,6 +61,7 @@ signal-hook = "0.3"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.60", features = [
+  # Security is required by CreateProcessW's SECURITY_ATTRIBUTES parameters
   "Win32_Foundation",
   "Win32_Security",
   "Win32_System_Console",

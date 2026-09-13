@@ -45,11 +45,11 @@ pub async fn connect_or_spawn() -> Result<IpcStream> {
         }
     }
     spawn_daemon()?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match IpcStream::connect(&path).await {
             Ok(s) => return Ok(s),
-            Err(e) if std::time::Instant::now() >= deadline => {
+            Err(e) if Instant::now() >= deadline => {
                 return Err(Error::Daemon(format!(
                     "daemon did not come up at {path}: {e}"
                 )));

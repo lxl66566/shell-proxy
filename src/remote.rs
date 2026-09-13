@@ -140,7 +140,7 @@ pub async fn execute(
     let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(64);
     let (sig_tx, mut sig_rx) = mpsc::channel::<Signal>(8);
     let forwarder = tokio::spawn(async move {
-        let mut writer = writer;
+        let writer = writer;
         let mut data_open = true;
         loop {
             if !data_open {
@@ -157,25 +157,22 @@ pub async fn execute(
             tokio::select! {
                 biased;
                 sig = sig_rx.recv() => {
-                    if let Some(sig) = sig {
-                        if send_frame(&writer, &ExecFrame::Signal(sig)).await.is_err() {
-                            break;
-                        }
+                    if let Some(sig) = sig
+                        && send_frame(&writer, &ExecFrame::Signal(sig)).await.is_err()
+                    {
+                        break;
                     }
                 },
                 d = data_rx.recv() => {
-                    match d {
-                        Some(d) => {
-                            if send_frame(&writer, &ExecFrame::StdinData(d)).await.is_err() {
-                                break;
-                            }
-                        },
-                        None => {
-                            // Data lane closed and drained: forward EOF, then
-                            // stay alive for late signals.
-                            let _ = send_frame(&writer, &ExecFrame::StdinEof).await;
-                            data_open = false;
-                        },
+                    if let Some(d) = d {
+                        if send_frame(&writer, &ExecFrame::StdinData(d)).await.is_err() {
+                            break;
+                        }
+                    } else {
+                        // Data lane closed and drained: forward EOF, then
+                        // stay alive for late signals.
+                        let _ = send_frame(&writer, &ExecFrame::StdinEof).await;
+                        data_open = false;
                     }
                 },
             }
