@@ -184,7 +184,14 @@ fn build_command(cli: &Cli) -> shell_proxy::Result<Option<(String, Vec<String>)>
         return Ok(Some((text, cmd_args())));
     }
     if !cli.cmd.is_empty() {
-        return Ok(Some((cmd_args().join(" "), Vec::new())));
+        // Args arrive shell-dequoted from the local shell; re-quote each one
+        // so the remote bash parses the joined line back into the same words.
+        let joined = cmd_args()
+            .iter()
+            .map(|s| shell_quote(s))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Ok(Some((joined, Vec::new())));
     }
     if !std::io::stdin().is_terminal() {
         let mut script = String::new();
@@ -194,4 +201,40 @@ fn build_command(cli: &Cli) -> shell_proxy::Result<Option<(String, Vec<String>)>
         }
     }
     Ok(None)
+}
+
+/// Quote `s` so bash parses it back as one word. Conservative safe set: only
+/// unambiguous everyday characters stay bare, everything else is single-quoted
+/// with the standard `'\''` escape.
+fn shell_quote(s: &str) -> String {
+    fn bare(c: char) -> bool {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-' | '.' | '/' | '=' | ':' | ',' | '%' | '@' | '+')
+    }
+    if !s.is_empty() && s.chars().all(bare) {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn quotes_only_what_needs_it() {
+        assert_eq!(shell_quote("ls"), "ls");
+        assert_eq!(shell_quote("-alF"), "-alF");
+        assert_eq!(shell_quote("/root/x.yml"), "/root/x.yml");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn quotes_embedded_quotes() {
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote("a\"b"), "'a\"b'");
+        assert_eq!(shell_quote("$HOME"), "'$HOME'");
+    }
 }
