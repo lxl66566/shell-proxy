@@ -33,8 +33,16 @@ pub async fn connect_or_spawn() -> Result<IpcStream> {
     }
     #[cfg(unix)]
     if path.starts_with('/') {
-        // A leftover socket from a dead daemon blocks the bind.
-        let _ = std::fs::remove_file(&path);
+        // Only a refused connection proves the socket file is stale (bound
+        // once, no listener anymore); removing it on any other error could
+        // race with a live daemon that just bound its socket.
+        match IpcStream::connect(&path).await {
+            Ok(s) => return Ok(s),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                let _ = std::fs::remove_file(&path);
+            },
+            Err(_) => {},
+        }
     }
     spawn_daemon()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
