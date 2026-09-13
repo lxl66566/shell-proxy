@@ -69,6 +69,9 @@ pub async fn deploy(handle: &SshHandle) -> Result<String> {
     let name = format!("sp-serve-{}-{}", env!("CARGO_PKG_VERSION"), arch.as_str());
     let path = format!("{SERVE_DIR}/{name}");
     if remote_matches(handle, &path, bin).await? {
+        if let Err(e) = cleanup_stale(handle, &name).await {
+            warn!("stale deployment cleanup failed: {e}");
+        }
         return Ok(path);
     }
 
@@ -83,8 +86,43 @@ pub async fn deploy(handle: &SshHandle) -> Result<String> {
             "deployed {path} failed checksum verification"
         )));
     }
+    if let Err(e) = cleanup_stale(handle, &name).await {
+        warn!("stale deployment cleanup failed: {e}");
+    }
     info!("deployed {path} ({} bytes)", bin.len());
     Ok(path)
+}
+
+/// Remove stale deployments (old versions, orphaned uploads) from SERVE_DIR,
+/// keeping `keep` (the just-verified binary name).
+///
+/// Only names this tool could have generated are considered, and each must
+/// match a strict character set before it is put into the `rm` command line -
+/// the remote login shell (fish, csh, ...) parses it. Deleting the path of a
+/// running binary is safe on Linux: the open inode survives.
+async fn cleanup_stale(handle: &SshHandle, keep: &str) -> Result<()> {
+    let (rc, out, _) = exec_collect(handle, &format!("ls {SERVE_DIR}")).await?;
+    if rc != 0 {
+        return Ok(()); // directory gone: nothing to clean
+    }
+    let tool_generated = |name: &str| {
+        (name.starts_with("sp-serve-") || name.starts_with(".upload-"))
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    let stale: Vec<String> = String::from_utf8_lossy(&out)
+        .lines()
+        .map(str::trim)
+        .filter(|n| *n != keep && tool_generated(n))
+        .map(|n| format!("{SERVE_DIR}/{n}"))
+        .collect();
+    if stale.is_empty() {
+        return Ok(());
+    }
+    exec_status(handle, &format!("rm -f {}", stale.join(" "))).await?;
+    info!("cleaned {} stale deployment(s)", stale.len());
+    Ok(())
 }
 
 /// Run one command through `sp-serve` over a fresh exec channel.
