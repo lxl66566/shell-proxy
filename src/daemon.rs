@@ -12,6 +12,7 @@ use std::{
 };
 
 use sp_proto::{EventFrame, ExecFrame, ExecRequest, ExitReport, INTERNAL_ERROR_CODE, Pong};
+use spdlog::{Level, LevelFilter, Logger, prelude::*, sink::FileSink};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{Mutex, mpsc},
@@ -370,8 +371,6 @@ async fn connect_state(host: &str) -> Result<Arc<HostState>> {
 }
 
 // -- logging -----------------------------------------------------------------
-
-use spdlog::{Level, LevelFilter, Logger, prelude::*, sink::FileSink};
 
 fn init_logger() -> std::io::Result<()> {
     let dir = config::app_dir().join("logs");
