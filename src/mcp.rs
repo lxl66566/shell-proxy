@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use crate::{
     client::{self, RunReport},
     config,
-    ipc::ExecRequest,
+    proto::ExecRequest,
 };
 
 /// Default per-call timeout for MCP-driven executions.

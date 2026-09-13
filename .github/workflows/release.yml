@@ -16,6 +16,15 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
+      # sp embeds the remote sp-serve binaries at build time (build.rs picks
+      # them up from target/<triple>/release/).
+      - name: build sp-serve for remote targets
+        shell: bash
+        run: |
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          export RUSTFLAGS="-C linker=rust-lld -C target-feature=+crt-static"
+          cargo build --release --locked -p sp-serve --target x86_64-unknown-linux-musl
+          cargo build --release --locked -p sp-serve --target aarch64-unknown-linux-musl
       - name: release rust project
         uses: lxl66566/rust-simple-release@main
         with:

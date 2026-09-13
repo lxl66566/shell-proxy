@@ -1,49 +1,20 @@
 [package]
 name         = "shell-proxy"
-version      = "0.1.0"
+version      = "0.2.0"
 edition      = "2024"
 rust-version = "1.88"
 description  = "Run local commands on a remote Linux host with persistent shell state"
 repository   = "https://github.com/lxl66566/shell-proxy"
 license      = "MIT OR Apache-2.0"
-keywords     = ["ssh", "shell", "remote", "proxy", "cli"]
+keywords     = ["cli", "proxy", "remote", "shell", "ssh"]
 categories   = ["command-line-utilities", "development-tools"]
-include      = ["/CHANGELOG.md", "/LICENSE-*", "/README.md", "/benches/**", "/src/**", "/tests/**"]
+build        = "build.rs"
+include      = ["/CHANGELOG.md", "/LICENSE-*", "/README.md", "/build.rs", "/crates/**", "/src/**", "/tests/**"]
 
-[lib]
-name = "shell_proxy"
+[workspace]
+members = ["crates/sp-proto", "crates/sp-serve"]
 
-[[bin]]
-name = "sp"
-path = "src/main.rs"
-
-[dependencies]
-anyhow      = "1"
-base64-simd = "0.8"
-clap        = { version = "4", features = ["derive"] }
-dirs        = "6"
-hex-simd    = "0.8"
-rand        = "0.9"
-rmcp        = { version = "3", features = ["transport-io"] }
-schemars    = "1"
-russh       = { version = "0.63", default-features = false, features = ["ring", "rsa"] }
-serde       = { version = "1", features = ["derive"] }
-serde_json  = "1"
-spdlog-rs   = { version = "0.5", features = ["flexible-string"] }
-thiserror   = "2"
-tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "sync"] }
-toml        = "0.9"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_System_Console", "Win32_Foundation"] }
-
-[target.'cfg(unix)'.dependencies]
-signal-hook = "0.3"
-
-[dev-dependencies]
-tempfile = "3"
-
-[lints.clippy]
+[workspace.lints.clippy]
 all                     = { level = "warn", priority = -1 }
 cargo                   = { level = "warn", priority = -1 }
 doc_markdown            = "allow"
@@ -53,12 +24,54 @@ multiple_crate_versions = "allow"
 pedantic                = { level = "warn", priority = -1 }
 wildcard_imports        = "allow"
 
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code           = "allow"
 unused_qualifications = "warn"
 
+[lib]
+name = "shell_proxy"
+
+[[bin]]
+name = "sp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow     = "1"
+clap       = { version = "4", features = ["derive"] }
+dirs       = "6"
+hex-simd   = "0.8"
+rand       = "0.9"
+rmcp       = { version = "3", features = ["transport-io"] }
+russh      = { version = "0.63", default-features = false, features = ["ring", "rsa"] }
+schemars   = "1"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2       = "0.10"
+sp-proto   = { path = "crates/sp-proto", version = "0.1" }
+spdlog-rs  = { version = "0.5", features = ["flexible-string"] }
+thiserror  = "2"
+tokio      = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+toml       = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target."cfg(unix)".dependencies]
+signal-hook = "0.3"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Console",
+  "Win32_System_Threading"
+] }
+
+[lints]
+workspace = true
+
 [profile.release]
-lto       = true
 opt-level = "s"
-panic     = "abort"
 strip     = true
+lto       = true
+panic     = "abort"

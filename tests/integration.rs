@@ -15,7 +15,7 @@ use std::{
 
 use shell_proxy::{
     client::{self, RunReport},
-    ipc::{ExecRequest, Signal},
+    proto::{ExecRequest, Signal},
 };
 use tokio::sync::mpsc;
 
@@ -48,14 +48,10 @@ fn harness() -> &'static Harness {
             std::env::set_var("SP_IDLE_SECS", "300");
         }
 
-        let daemon = Command::new(env!("CARGO_BIN_EXE_sp"))
-            .arg("daemon")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn daemon");
-        // Best effort: if the test process dies, take the daemon with us.
-        std::mem::forget(daemon); // the idle timeout cleans it up instead
+        // The daemon must not inherit our handles (std::process::Command
+        // inherits all of them on Windows and would pin the test runner's
+        // pipes open forever); spawn_daemon gets this right.
+        client::spawn_daemon().expect("spawn daemon");
 
         Harness {
             host: std::env::var("SP_TEST_HOST").unwrap_or_else(|_| "ls".into()),
@@ -187,15 +183,15 @@ async fn interactive_shell_flag_and_bashrc() {
 }
 
 #[tokio::test]
-async fn marker_does_not_pollute_output() {
+async fn binary_output_is_byte_exact() {
     let Some(_g) = guard().await else { return };
-    // No trailing newline: the cwd marker must be stripped byte-exactly.
+    // No trailing newline: output must pass through byte-exactly.
     let (rep, out, _) = run("printf hi", None, None).await.unwrap();
     assert_eq!(rep.code, 0);
     assert_eq!(out, b"hi");
-    // Binary with 0x1c bytes (marker start byte) must pass through.
-    let (_, out2, _) = run(r"printf 'a\x1cb'", None, None).await.unwrap();
-    assert_eq!(out2, b"a\x1cb");
+    // Arbitrary binary (incl. control bytes) must pass through unmangled.
+    let (_, out2, _) = run(r"printf 'a\x1cb\x00\xff'", None, None).await.unwrap();
+    assert_eq!(out2, b"a\x1cb\x00\xff");
 }
 
 #[tokio::test]
@@ -292,18 +288,26 @@ async fn exec_replacement_still_reports_rc() {
 }
 
 #[tokio::test]
-async fn no_leftover_scripts() {
+async fn serve_binary_is_deployed() {
     let Some(_g) = guard().await else { return };
-    run("echo cleanup-check", None, None).await.unwrap();
-    let (rep, out, _) = run("ls /tmp/.sp-*.sh 2>/dev/null | wc -l", None, None)
-        .await
-        .unwrap();
+    let (rep, out, _) = run(
+        "ls ~/.local/share/shell-proxy/sp-serve-*-* | wc -l",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(rep.code, 0);
-    assert_eq!(
-        out_str(&out).trim(),
-        "0",
-        "wrapper scripts must self-delete"
-    );
+    assert_eq!(out_str(&out).trim(), "1", "exactly one sp-serve binary");
+    let (rep2, out2, _) = run(
+        "test -x ~/.local/share/shell-proxy/sp-serve-*-* && echo executable",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rep2.code, 0);
+    assert_eq!(out_str(&out2).trim(), "executable");
 }
 
 #[tokio::test]

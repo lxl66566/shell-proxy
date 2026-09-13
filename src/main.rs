@@ -6,7 +6,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use shell_proxy::{
     client::{self, RunIo},
     config, console,
-    ipc::{ExecRequest, Signal},
+    proto::{ExecRequest, Signal},
 };
 use tokio::sync::mpsc;
 
@@ -57,8 +57,22 @@ enum Sub {
     Status,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // Manual runtime: `shutdown_background` below must not wait for parked
+    // blocking tasks. `tokio::io::stdin()` reads are dispatched to the
+    // blocking pool, and a console read only completes on Enter - with the
+    // default `#[tokio::main]` teardown the process would hang on exit until
+    // the user pressed a key.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let code = rt.block_on(async_main());
+    rt.shutdown_background();
+    code
+}
+
+async fn async_main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.sub {
@@ -122,8 +136,17 @@ async fn run_command(cli: Cli) -> ExitCode {
     let (sig_tx, sig_rx) = mpsc::channel::<Signal>(4);
     console::install(sig_tx);
 
+    // A terminal stdin is not forwarded (no TUI support): typing would compete
+    // with the console for input and keep a blocking read parked. Piped stdin
+    // is forwarded as usual.
+    let stdin: Box<dyn tokio::io::AsyncRead + Send + Unpin> = if std::io::stdin().is_terminal() {
+        Box::new(tokio::io::empty())
+    } else {
+        Box::new(tokio::io::stdin())
+    };
+
     let io = RunIo {
-        stdin: Box::new(tokio::io::stdin()),
+        stdin,
         stdout: Box::new(tokio::io::stdout()),
         stderr: Box::new(tokio::io::stderr()),
     };
@@ -146,18 +169,19 @@ async fn run_command(cli: Cli) -> ExitCode {
 
 /// Build the command text: file mode, positional args, or piped stdin.
 fn build_command(cli: &Cli) -> shell_proxy::Result<Option<(String, Vec<String>)>> {
-    if let Some(file) = &cli.file {
-        let text = client::read_script_file(file)?;
-        return Ok(Some((text, Vec::new())));
-    }
-    if !cli.cmd.is_empty() {
-        let joined = cli
-            .cmd
+    let cmd_args = || {
+        cli.cmd
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect::<Vec<String>>()
-            .join(" ");
-        return Ok(Some((joined, Vec::new())));
+    };
+    if let Some(file) = &cli.file {
+        let text = client::read_script_file(file)?;
+        // Trailing args after `--` become the script's positional parameters.
+        return Ok(Some((text, cmd_args())));
+    }
+    if !cli.cmd.is_empty() {
+        return Ok(Some((cmd_args().join(" "), Vec::new())));
     }
     if !std::io::stdin().is_terminal() {
         let mut script = String::new();

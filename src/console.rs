@@ -4,7 +4,7 @@
 
 use tokio::sync::mpsc;
 
-use crate::ipc::Signal;
+use crate::proto::Signal;
 
 /// Install handlers that forward SIGINT/SIGTERM to `tx`.
 ///

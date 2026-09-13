@@ -48,6 +48,16 @@ pub enum Error {
     TimedOut,
 }
 
+impl From<sp_proto::Error> for Error {
+    fn from(e: sp_proto::Error) -> Self {
+        match e {
+            sp_proto::Error::Io(e) => Error::Io(e),
+            sp_proto::Error::Json(e) => Error::Json(e),
+            sp_proto::Error::Protocol(m) => Error::Protocol(m),
+        }
+    }
+}
+
 impl Error {
     /// Human oriented short reason, used by the CLI to print one-line errors.
     #[must_use]

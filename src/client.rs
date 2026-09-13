@@ -11,7 +11,9 @@ use tokio::{
 use crate::{
     config,
     error::{Error, Result},
-    ipc::{ClientFrame, DaemonFrame, ExecRequest, ExitReport, Signal, read_frame, write_frame},
+    proto::{
+        EventFrame, ExecFrame, ExecRequest, ExitReport, Signal, read_event_frame, write_exec_frame,
+    },
     transport::IpcStream,
 };
 
@@ -41,28 +43,80 @@ pub async fn connect_or_spawn() -> Result<IpcStream> {
     }
 }
 
-fn spawn_daemon() -> Result<()> {
+/// Spawn the daemon detached; see the Windows notes on the `cfg(windows)`
+/// twin. On unix the daemon gets its own process group so terminal Ctrl+C
+/// does not hit it.
+#[cfg(unix)]
+pub fn spawn_daemon() -> Result<()> {
+    use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().map_err(|e| Error::Daemon(format!("current_exe: {e}")))?;
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        // Detached: survives the console and ignores console Ctrl+C events.
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Own process group: terminal Ctrl+C must not hit the daemon.
-        cmd.process_group(0);
-    }
+    // Own process group: terminal Ctrl+C must not hit the daemon.
+    cmd.process_group(0);
     cmd.spawn()
         .map_err(|e| Error::Daemon(format!("spawn daemon {}: {e}", exe.display())))?;
+    Ok(())
+}
+
+/// Spawn the daemon detached; inherits the environment (SP_SOCK etc.) but no
+/// handles and no console.
+///
+/// `std::process::Command` always inherits every inheritable handle on
+/// Windows; the daemon would then pin the parent's console pipes open and any
+/// parent reading them to EOF (terminals, editors, CI) hangs forever. With
+/// DETACHED_PROCESS and no inherited handles the daemon gets no stdio at all,
+/// which is fine: it only writes to its log file.
+#[cfg(windows)]
+pub fn spawn_daemon() -> Result<()> {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{
+            CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS, PROCESS_INFORMATION,
+            STARTUPINFOW,
+        },
+    };
+
+    let exe = std::env::current_exe().map_err(|e| Error::Daemon(format!("current_exe: {e}")))?;
+    let mut cmdline: Vec<u16> = format!("\"{}\" daemon", exe.display())
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = u32::try_from(size_of::<STARTUPINFOW>()).expect("size fits");
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: cmdline is a valid mutable nul-terminated UTF-16 buffer kept
+    // alive for the call; si/pi are correctly sized out-params; the returned
+    // process/thread handles are closed immediately.
+    let ok = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmdline.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            std::ptr::null(),
+            std::ptr::null(),
+            &raw const si,
+            &raw mut pi,
+        )
+    };
+    if ok == 0 {
+        return Err(Error::Daemon(format!(
+            "spawn daemon {}: {}",
+            exe.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: both handles are valid after a successful CreateProcessW.
+    unsafe {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
     Ok(())
 }
 
@@ -72,11 +126,11 @@ pub async fn ping() -> Result<u32> {
     let mut stream = IpcStream::connect(&path)
         .await
         .map_err(|e| Error::Daemon(format!("daemon not running at {path}: {e}")))?;
-    write_frame(&mut stream, &ClientFrame::Ping).await?;
-    match tokio::time::timeout(Duration::from_secs(3), read_frame(&mut stream)).await {
-        Ok(Ok(Some(DaemonFrame::Pong(p)))) => Ok(p.pid),
+    write_exec_frame(&mut stream, &ExecFrame::Ping).await?;
+    match tokio::time::timeout(Duration::from_secs(3), read_event_frame(&mut stream)).await {
+        Ok(Ok(Some(EventFrame::Pong(p)))) => Ok(p.pid),
         Ok(Ok(other)) => Err(Error::Protocol(format!("unexpected reply: {other:?}"))),
-        Ok(Err(e)) => Err(Error::Ipc(e.brief())),
+        Ok(Err(e)) => Err(Error::Ipc(e.to_string())),
         Err(_) => Err(Error::Ipc("ping timed out".into())),
     }
 }
@@ -117,7 +171,7 @@ pub async fn run(
     mut signals: mpsc::Receiver<Signal>,
 ) -> Result<RunReport> {
     let mut stream = connect_or_spawn().await?;
-    write_frame(&mut stream, &ClientFrame::Exec(req)).await?;
+    write_exec_frame(&mut stream, &ExecFrame::Exec(req)).await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     let RunIo {
@@ -139,27 +193,31 @@ pub async fn run(
             n = stdin.read(&mut in_buf), if stdin_open => {
                 match n {
                     Ok(0) => {
-                        write_frame(&mut writer, &ClientFrame::StdinEof).await?;
+                        write_exec_frame(&mut writer, &ExecFrame::StdinEof).await?;
                         stdin_open = false;
                     }
                     Ok(n) => {
-                        write_frame(&mut writer, &ClientFrame::StdinData(in_buf[..n].to_vec())).await?;
+                        write_exec_frame(&mut writer, &ExecFrame::StdinData(in_buf[..n].to_vec())).await?;
                     }
-                    Err(_) => stdin_open = false, // unreadable stdin: stop forwarding
+                    Err(_) => {
+                        // Unreadable stdin: tell the daemon it is done.
+                        let _ = write_exec_frame(&mut writer, &ExecFrame::StdinEof).await;
+                        stdin_open = false;
+                    }
                 }
             }
-            frame = read_frame(&mut reader) => {
+            frame = read_event_frame(&mut reader) => {
                 match frame? {
-                    Some(DaemonFrame::Stdout(d)) => {
+                    Some(EventFrame::Stdout(d)) => {
                         stdout.write_all(&d).await?;
                         stdout.flush().await?;
                     }
-                    Some(DaemonFrame::Stderr(d)) => {
+                    Some(EventFrame::Stderr(d)) => {
                         stderr.write_all(&d).await?;
                         stderr.flush().await?;
                     }
-                    Some(DaemonFrame::Exit(rep)) => break Ok(RunReport::from(rep)),
-                    Some(DaemonFrame::Pong(_)) => {}
+                    Some(EventFrame::Exit(rep)) => break Ok(RunReport::from(rep)),
+                    Some(EventFrame::Pong(_)) => {}
                     None => {
                         break Err(Error::Daemon(
                             "daemon closed the connection before exit".into(),
@@ -170,7 +228,7 @@ pub async fn run(
             sig = signals.recv(), if signals_open => {
                 match sig {
                     Some(sig) => {
-                        write_frame(&mut writer, &ClientFrame::Signal(sig)).await?;
+                        write_exec_frame(&mut writer, &ExecFrame::Signal(sig)).await?;
                     }
                     None => signals_open = false,
                 }

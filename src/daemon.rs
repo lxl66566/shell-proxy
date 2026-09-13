@@ -1,6 +1,6 @@
-//! The resident daemon: owns persistent SSH connections per host, serializes
-//! commands per host (cwd is shared state), streams output back over IPC and
-//! logs every execution.
+//! The resident daemon: owns persistent SSH connections per host, deploys
+//! `sp-serve`, serializes commands per host (cwd is shared state), streams
+//! output back over IPC and logs every execution.
 
 use std::{
     collections::HashMap,
@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use sp_proto::{EventFrame, ExecFrame, ExecRequest, ExitReport, Pong};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{Mutex, mpsc},
@@ -19,10 +20,7 @@ use tokio::{
 use crate::{
     config,
     error::{Error, Result},
-    exec::{self, ExecOutcome, InputEvent, OutputEvent},
-    ipc,
-    ipc::{DaemonFrame, ExecRequest, ExitReport, Pong},
-    script::{self, ScriptSpec},
+    remote::{self, ExecOutcome, InputEvent, OutputEvent},
     ssh::{self, SshConnection},
     ssh_config,
 };
@@ -33,6 +31,8 @@ const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 /// One host alias with its connection and persisted shell state.
 struct HostState {
     conn: SshConnection,
+    /// Remote path of the deployed sp-serve binary.
+    serve_path: String,
     cwd: std::sync::Mutex<Option<String>>,
     /// Serializes executions so cwd updates apply in order.
     lock: Mutex<()>,
@@ -130,27 +130,30 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 ) -> Result<()> {
     let (mut reader, mut writer) = tokio::io::split(stream);
     // Single writer task keeps frame writes ordered.
-    let (out_tx, mut out_rx) = mpsc::channel::<DaemonFrame>(256);
+    let (out_tx, mut out_rx) = mpsc::channel::<EventFrame>(256);
     tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
-            if ipc::write_daemon_frame(&mut writer, &frame).await.is_err() {
+            if sp_proto::write_event_frame(&mut writer, &frame)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
     });
 
-    while let Some(frame) = ipc::read_client_frame(&mut reader).await? {
+    while let Some(frame) = sp_proto::read_exec_frame(&mut reader).await? {
         match frame {
-            ipc::ClientFrame::Ping => {
+            ExecFrame::Ping => {
                 let _ = out_tx
-                    .send(DaemonFrame::Pong(Pong {
+                    .send(EventFrame::Pong(Pong {
                         pid: std::process::id(),
                     }))
                     .await;
             },
             // One exec per connection: stdin forwarding interleaves with the
             // engine, so the connection is closed after it finishes.
-            ipc::ClientFrame::Exec(req) => {
+            ExecFrame::Exec(req) => {
                 handle_exec(&shared, req, reader, &out_tx).await;
                 return Ok(());
             },
@@ -167,7 +170,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
     shared: &Arc<Shared>,
     req: ExecRequest,
     mut reader: S,
-    out_tx: &mpsc::Sender<DaemonFrame>,
+    out_tx: &mpsc::Sender<EventFrame>,
 ) {
     let started = Instant::now();
     let state = match get_or_connect(shared, &req.host).await {
@@ -175,7 +178,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
         Err(e) => {
             warn!("connect host={} failed: {e}", req.host);
             let _ = out_tx
-                .send(DaemonFrame::Exit(ExitReport {
+                .send(EventFrame::Exit(ExitReport {
                     code: 254,
                     cwd: None,
                     error: Some(e.brief()),
@@ -191,18 +194,8 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
         .clone()
         .or_else(|| state.cwd.lock().expect("cwd lock").clone());
 
-    let nonce_hex = new_nonce();
-    let spec = ScriptSpec {
-        command: &req.command,
-        args: &req.args,
-        cwd: start_cwd.as_deref(),
-        nonce_hex: &nonce_hex,
-    };
-    let script_text = script::build(&spec);
-    let timeout = req
-        .timeout_ms
-        .filter(|ms| *ms > 0)
-        .map(Duration::from_millis);
+    let mut eff_req = req.clone();
+    eff_req.cwd = start_cwd.clone();
 
     let (input_tx, input_rx) = mpsc::channel::<InputEvent>(64);
     let (event_tx, mut event_rx) = mpsc::channel::<OutputEvent>(256);
@@ -215,11 +208,11 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
             let frame = match ev {
                 OutputEvent::Stdout(d) => {
                     out_ctr.fetch_add(d.len() as u64, Ordering::Relaxed);
-                    DaemonFrame::Stdout(d)
+                    EventFrame::Stdout(d)
                 },
                 OutputEvent::Stderr(d) => {
                     err_ctr.fetch_add(d.len() as u64, Ordering::Relaxed);
-                    DaemonFrame::Stderr(d)
+                    EventFrame::Stderr(d)
                 },
             };
             if bridge_tx.send(frame).await.is_err() {
@@ -228,37 +221,36 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
         }
     });
 
-    let mut engine = std::pin::pin!(exec::execute(
+    let mut engine = std::pin::pin!(remote::execute(
         state.conn.handle(),
-        script_text,
-        &nonce_hex,
-        timeout,
+        &state.serve_path,
+        &eff_req,
         input_rx,
         event_tx,
     ));
 
     let outcome: std::result::Result<ExecOutcome, String> = loop {
         tokio::select! {
-            frame = ipc::read_client_frame(&mut reader) => {
+            frame = sp_proto::read_exec_frame(&mut reader) => {
                 match frame {
-                    Ok(Some(ipc::ClientFrame::StdinData(d))) => {
+                    Ok(Some(ExecFrame::StdinData(d))) => {
                         if input_tx.send(InputEvent::Stdin(d)).await.is_err() {
                             break Err("engine died unexpectedly".into());
                         }
                     }
-                    Ok(Some(ipc::ClientFrame::StdinEof)) => {
+                    Ok(Some(ExecFrame::StdinEof)) => {
                         let _ = input_tx.send(InputEvent::StdinEof).await;
                     }
-                    Ok(Some(ipc::ClientFrame::Signal(s))) => {
-                        info!("forwarding signal {s:?} to engine");
+                    Ok(Some(ExecFrame::Signal(s))) => {
+                        info!("forwarding signal {} to engine", s.as_str());
                         let _ = input_tx.send(InputEvent::Signal(s)).await;
                     }
-                    Ok(Some(ipc::ClientFrame::Ping)) => {
+                    Ok(Some(ExecFrame::Ping)) => {
                         let _ = out_tx
-                            .send(DaemonFrame::Pong(Pong { pid: std::process::id() }))
+                            .send(EventFrame::Pong(Pong { pid: std::process::id() }))
                             .await;
                     }
-                    Ok(Some(ipc::ClientFrame::Exec(_))) => {
+                    Ok(Some(ExecFrame::Exec(_))) => {
                         let _ = input_tx.send(InputEvent::StdinEof).await;
                         break Err("nested exec on one connection is not supported".into());
                     }
@@ -266,7 +258,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
                         // Client vanished; give the remote side EOF, not a kill.
                         let _ = input_tx.send(InputEvent::StdinEof).await;
                     }
-                    Err(e) => break Err(e.brief()),
+                    Err(e) => break Err(e.to_string()),
                 }
             }
             res = &mut engine => {
@@ -318,7 +310,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
         abbreviate(&req.command),
     );
 
-    let _ = out_tx.send(DaemonFrame::Exit(report)).await;
+    let _ = out_tx.send(EventFrame::Exit(report)).await;
 }
 
 fn abbreviate(s: &str) -> String {
@@ -337,11 +329,6 @@ fn abbreviate(s: &str) -> String {
     }
 }
 
-fn new_nonce() -> String {
-    let bytes: [u8; 16] = rand::random();
-    hex_simd::encode_to_string(bytes, hex_simd::AsciiCase::Lower)
-}
-
 /// Get a live connection for `host`, connecting (or reconnecting) as needed.
 async fn get_or_connect(shared: &Arc<Shared>, host: &str) -> Result<Arc<HostState>> {
     let mut hosts = shared.hosts.lock().await;
@@ -358,8 +345,10 @@ async fn get_or_connect(shared: &Arc<Shared>, host: &str) -> Result<Arc<HostStat
 async fn connect_state(host: &str) -> Result<Arc<HostState>> {
     let resolved = ssh_config::resolve(host).await?;
     let conn = ssh::connect(resolved).await?;
+    let serve_path = remote::deploy(conn.handle()).await?;
     Ok(Arc::new(HostState {
         conn,
+        serve_path,
         cwd: std::sync::Mutex::new(None),
         lock: Mutex::new(()),
     }))
