@@ -153,6 +153,9 @@ async fn run_command(cli: Cli) -> ExitCode {
 
     match client::run(req, io, sig_rx).await {
         Ok(report) => {
+            if let Some(e) = &report.error {
+                eprintln!("sp: {e}");
+            }
             if report.timed_out {
                 eprintln!("sp: command timed out");
                 return ExitCode::from(EXIT_TIMEOUT);

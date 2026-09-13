@@ -148,6 +148,9 @@ pub struct RunReport {
     pub code: i32,
     pub cwd: Option<String>,
     pub timed_out: bool,
+    /// Daemon/serve-side failure reason (connect, auth, deploy, ...), when the
+    /// daemon reported one alongside a non-zero code.
+    pub error: Option<String>,
 }
 
 impl From<ExitReport> for RunReport {
@@ -156,6 +159,7 @@ impl From<ExitReport> for RunReport {
             code: r.code,
             cwd: r.cwd,
             timed_out: r.timed_out,
+            error: r.error,
         }
     }
 }

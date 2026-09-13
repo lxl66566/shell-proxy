@@ -79,6 +79,9 @@ fn format_report(report: &RunReport, stdout: &[u8], stderr: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let _ = writeln!(out, "exit_code: {}", report.code);
+    if let Some(e) = &report.error {
+        let _ = writeln!(out, "error: {e}");
+    }
     if let Some(cwd) = &report.cwd {
         let _ = writeln!(out, "cwd: {cwd}");
     }

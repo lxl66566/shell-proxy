@@ -311,6 +311,25 @@ async fn serve_binary_is_deployed() {
 }
 
 #[tokio::test]
+async fn daemon_error_surfaces_in_report() {
+    let Some(_g) = guard().await else { return };
+    // The daemon reports connect failures inside the Exit frame; the client
+    // must keep them instead of exiting 254 silently.
+    let req = ExecRequest {
+        host: "sp-test-unreachable-host.invalid".into(),
+        command: "true".into(),
+        args: vec![],
+        cwd: None,
+        timeout_ms: Some(10_000),
+    };
+    let (_tx, rx) = mpsc::channel(1);
+    let (rep, ..) = client::run_captured(req, Vec::new(), rx).await.unwrap();
+    assert_eq!(rep.code, 254);
+    let err = rep.error.expect("error reason must be surfaced");
+    assert!(!err.is_empty(), "error reason must not be empty");
+}
+
+#[tokio::test]
 async fn cli_exit_code_passthrough() {
     let Some(_g) = guard().await else { return };
     let out = Command::new(env!("CARGO_BIN_EXE_sp"))
