@@ -10,11 +10,12 @@ use std::{
         OnceLock,
         atomic::{AtomicU8, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use shell_proxy::{
     client::{self, RunReport},
+    config,
     proto::{ExecRequest, Signal},
 };
 use tokio::sync::mpsc;
@@ -41,16 +42,21 @@ fn harness() -> &'static Harness {
                 .into_owned()
         };
         // SAFETY: every test reaches `harness()` before touching SP_SOCK /
-        // SP_IDLE_SECS, and OnceLock serializes this initialization, so no
-        // thread reads these variables while they are being written.
+        // SP_IDLE_SECS / SP_DAEMON_EXE, and OnceLock serializes this
+        // initialization, so no thread reads these variables while they are
+        // being written.
         unsafe {
-            std::env::set_var("SP_SOCK", &sock);
+            std::env::set_var(config::ENV_SOCK, &sock);
             std::env::set_var("SP_IDLE_SECS", "300");
+            // The daemon must be the real sp binary: current_exe() here is the
+            // test binary, and libtest would parse "daemon" as a test-name
+            // filter, re-running matching tests that spawn more copies of
+            // themselves. spawn_daemon also avoids inheriting our handles
+            // (std::process::Command inherits all of them on Windows and would
+            // pin the test runner's pipes open forever).
+            std::env::set_var(config::ENV_DAEMON_EXE, env!("CARGO_BIN_EXE_sp"));
         }
 
-        // The daemon must not inherit our handles (std::process::Command
-        // inherits all of them on Windows and would pin the test runner's
-        // pipes open forever); spawn_daemon gets this right.
         client::spawn_daemon().expect("spawn daemon");
 
         Harness {
@@ -66,6 +72,7 @@ async fn guard() -> Option<tokio::sync::MutexGuard<'static, ()>> {
     let h = harness();
     let guard = h.lock.lock().await;
     if h.reachable.load(Ordering::SeqCst) == 0 {
+        wait_for_daemon().await;
         let probe = run("exit 0", None, None).await;
         match probe {
             Ok(_) => h.reachable.store(1, Ordering::SeqCst),
@@ -80,6 +87,22 @@ async fn guard() -> Option<tokio::sync::MutexGuard<'static, ()>> {
         return None;
     }
     Some(guard)
+}
+
+/// Panic unless the daemon answers a ping within the startup window. A dead
+/// daemon is broken test infrastructure and must fail loudly; without this
+/// every test silently skips and the run still reports success.
+async fn wait_for_daemon() {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match client::ping().await {
+            Ok(_) => return,
+            Err(e) if Instant::now() >= deadline => {
+                panic!("daemon not answering at {}: {e}", config::sock_path());
+            },
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
 }
 
 async fn run(
@@ -250,7 +273,7 @@ async fn cwd_persists_across_calls() {
 #[tokio::test]
 async fn timeout_kills_command() {
     let Some(_g) = guard().await else { return };
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let (rep, ..) = run("sleep 60", None, Some(1500)).await.unwrap();
     assert!(rep.timed_out, "expected timeout");
     assert_eq!(rep.code, 124);
@@ -271,7 +294,7 @@ async fn sigint_forwards_to_remote() {
     let spawned = tokio::spawn(client::run_captured(req, Vec::new(), rx));
     tokio::time::sleep(Duration::from_millis(800)).await;
     tx.send(Signal::Int).await.unwrap();
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let (rep, ..) = spawned.await.unwrap().unwrap();
     assert_eq!(rep.code, 130, "SIGINT should surface as 130");
     assert!(started.elapsed() < Duration::from_secs(5));

@@ -8,6 +8,10 @@ use crate::error::{Error, Result};
 
 /// Env var overriding the daemon socket path (mainly for tests).
 pub const ENV_SOCK: &str = "SP_SOCK";
+/// Env var overriding the binary spawned as the daemon (mainly for tests:
+/// the test binary must not respawn itself, libtest would parse "daemon" as a
+/// test-name filter and recurse).
+pub const ENV_DAEMON_EXE: &str = "SP_DAEMON_EXE";
 /// Env var overriding the default host.
 pub const ENV_HOST: &str = "SP_HOST";
 

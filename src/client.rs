@@ -2,7 +2,7 @@
 //! command and pump stdin/stdout/stderr/signals.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -59,13 +59,25 @@ pub async fn connect_or_spawn() -> Result<IpcStream> {
     }
 }
 
+/// Binary to run as the daemon: `SP_DAEMON_EXE` when set, else ourselves.
+/// Tests must point it at the real binary: respawning a test binary would
+/// hand "daemon" to libtest as a test-name filter.
+fn daemon_exe() -> Result<PathBuf> {
+    if let Some(exe) = std::env::var_os(config::ENV_DAEMON_EXE)
+        && !exe.is_empty()
+    {
+        return Ok(PathBuf::from(exe));
+    }
+    std::env::current_exe().map_err(|e| Error::Daemon(format!("current_exe: {e}")))
+}
+
 /// Spawn the daemon detached; see the Windows notes on the `cfg(windows)`
 /// twin. On unix the daemon gets its own process group so terminal Ctrl+C
 /// does not hit it.
 #[cfg(unix)]
 pub fn spawn_daemon() -> Result<()> {
     use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe().map_err(|e| Error::Daemon(format!("current_exe: {e}")))?;
+    let exe = daemon_exe()?;
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("daemon")
         .stdin(std::process::Stdio::null())
@@ -96,7 +108,7 @@ pub fn spawn_daemon() -> Result<()> {
         },
     };
 
-    let exe = std::env::current_exe().map_err(|e| Error::Daemon(format!("current_exe: {e}")))?;
+    let exe = daemon_exe()?;
     let mut cmdline: Vec<u16> = format!("\"{}\" daemon", exe.display())
         .encode_utf16()
         .chain(Some(0))
