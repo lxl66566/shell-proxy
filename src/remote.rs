@@ -346,7 +346,26 @@ async fn exec_status(handle: &SshHandle, cmd: &str) -> Result<()> {
 }
 
 /// Check whether the remote file's sha256 matches `expected`.
+///
+/// Fast path hashes remotely (coreutils and busybox both provide sha256sum),
+/// transferring 64 bytes instead of the whole binary. When the tool is
+/// missing (rc 127) the file is pulled and hashed locally instead.
 async fn remote_matches(handle: &SshHandle, path: &str, expected: &[u8]) -> Result<bool> {
+    let expected_hex =
+        hex_simd::encode_to_string(Sha256::digest(expected), hex_simd::AsciiCase::Lower);
+    let (rc, out, _) = exec_collect(handle, &format!("sha256sum {path}")).await?;
+    if rc == 0 {
+        let got = String::from_utf8_lossy(&out)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        return Ok(got == expected_hex);
+    }
+    if rc != 127 {
+        // Hashed fine but the file is missing/unreadable: redeploy.
+        return Ok(false);
+    }
     let (rc, out, _) = exec_collect(handle, &format!("cat {path}")).await?;
     if rc != 0 {
         return Ok(false); // missing or unreadable: deploy
