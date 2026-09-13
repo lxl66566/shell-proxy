@@ -2,20 +2,20 @@
 name         = "sp-serve"
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description  = "Remote execution server for shell-proxy; speaks sp-proto frames on stdio"
 repository   = "https://github.com/lxl66566/shell-proxy"
 license      = "MIT OR Apache-2.0"
-keywords     = ["ssh", "shell", "remote", "server"]
+keywords     = ["remote", "server", "shell", "ssh"]
 categories   = ["development-tools"]
 
 # unix-only: the binary is cross-built for linux targets and deployed to the
 # remote host; on other hosts it is a stub that just refuses to run.
-[target.'cfg(unix)'.dependencies]
+[target."cfg(unix)".dependencies]
 anyhow   = "1"
 libc     = "0.2"
-sp-proto = { version = "0.1", path = "../sp-proto" }
-tokio    = { version = "1", features = ["rt", "macros", "io-util", "io-std", "process", "time", "sync", "net"] }
+sp-proto = { path = "../sp-proto", version = "0.1" }
+tokio    = { version = "1", features = ["io-std", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
 
 [lints]
 workspace = true

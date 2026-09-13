@@ -2,11 +2,11 @@
 name         = "sp-proto"
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description  = "Wire protocol shared by the shell-proxy client, daemon and remote server"
 repository   = "https://github.com/lxl66566/shell-proxy"
 license      = "MIT OR Apache-2.0"
-keywords     = ["ssh", "shell", "remote", "protocol"]
+keywords     = ["protocol", "remote", "shell", "ssh"]
 categories   = ["development-tools"]
 
 [dependencies]
@@ -15,7 +15,7 @@ serde_json = "1"
 thiserror  = "2"
 tokio      = { version = "1", features = ["io-util"] }
 
-[target.'cfg(unix)'.dependencies]
+[target."cfg(unix)".dependencies]
 libc = "0.2"
 
 [lints]
