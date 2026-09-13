@@ -5,6 +5,7 @@
 
 use std::{path::PathBuf, time::Duration};
 
+use spdlog::prelude::*;
 use tokio::process::Command;
 
 use crate::error::{Error, Result};
@@ -35,8 +36,12 @@ pub struct ResolvedHost {
 pub async fn resolve(host: &str) -> Result<ResolvedHost> {
     match run_ssh_g(host).await {
         Ok(r) => Ok(r),
-        // ssh -G broken or absent: best-effort direct connection.
-        Err(_) => Ok(fallback(host)),
+        Err(e) => {
+            // Masking this would surface as a confusing "connect to <alias>
+            // failed" later; the reason belongs in the daemon log.
+            warn!("ssh -G failed, falling back to a direct connection: {e}");
+            Ok(fallback(host))
+        },
     }
 }
 
