@@ -1,7 +1,10 @@
 //! Client side: connect to the daemon (spawning it when absent), run one
 //! command and pump stdin/stdout/stderr/signals.
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -16,6 +19,11 @@ use crate::{
     },
     transport::IpcStream,
 };
+
+/// Two Ctrl+C presses within this window force a local exit (130). The daemon
+/// may be wedged and unable to relay the remote exit code; a healthy flow
+/// reports it before a human can press twice.
+const FORCE_EXIT_WINDOW: Duration = Duration::from_secs(1);
 
 /// Connect to the daemon, spawning it if it is not running yet.
 pub async fn connect_or_spawn() -> Result<IpcStream> {
@@ -191,6 +199,7 @@ pub async fn run(
     let mut in_buf = vec![0u8; 64 * 1024];
     let mut stdin_open = true;
     let mut signals_open = true;
+    let mut last_int: Option<Instant> = None;
 
     let report = loop {
         tokio::select! {
@@ -231,9 +240,22 @@ pub async fn run(
             }
             sig = signals.recv(), if signals_open => {
                 match sig {
+                    Some(Signal::Int) => {
+                        let now = Instant::now();
+                        if last_int.is_some_and(|t| now.duration_since(t) < FORCE_EXIT_WINDOW) {
+                            break Ok(RunReport {
+                                code: 130,
+                                cwd: None,
+                                timed_out: false,
+                                error: None,
+                            });
+                        }
+                        last_int = Some(now);
+                        write_exec_frame(&mut writer, &ExecFrame::Signal(Signal::Int)).await?;
+                    },
                     Some(sig) => {
                         write_exec_frame(&mut writer, &ExecFrame::Signal(sig)).await?;
-                    }
+                    },
                     None => signals_open = false,
                 }
             }
