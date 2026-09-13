@@ -14,9 +14,6 @@ pub enum Error {
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("ssh error: {0}")]
-    Ssh(#[from] russh::Error),
-
     #[error("config error: {0}")]
     Config(String),
 
@@ -43,9 +40,6 @@ pub enum Error {
 
     #[error("protocol error: {0}")]
     Protocol(String),
-
-    #[error("command timed out")]
-    TimedOut,
 }
 
 impl From<sp_proto::Error> for Error {
