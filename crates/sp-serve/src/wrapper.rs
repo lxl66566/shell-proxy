@@ -24,16 +24,16 @@ pub fn rc_body(stderr_fd: i32) -> String {
 /// - `SP_CWD` (env) selects the starting directory;
 /// - the command text is read verbatim from `cmd_fd` and `eval`ed in this shell, so `sp cd ...`
 ///   mutates the working directory we report;
-/// - after the command, the final `$PWD` is written to `cwd_fd` (out of band, stdout stays
+/// - after the command, the final `$PWD` is written to `pwd_fd` (out of band, stdout stays
 ///   byte-clean) and the command's exit status is propagated;
 /// - the traps pin the exit status to 128+signum when a group-wide signal (sent by serve on local
 ///   Ctrl+C / timeout) also hits this bash.
-pub fn wrapper_body(cmd_fd: i32, cwd_fd: i32) -> String {
+pub fn wrapper_body(cmd_fd: i32, pwd_fd: i32) -> String {
     format!(
         "if [ -n \"${{SP_CWD:-}}\" ]; then\n  cd -- \"$SP_CWD\" || {{ printf 'sp: cannot cd to \
          %s, using HOME\\n' \"$SP_CWD\" >&2; cd; }}\nfi\ntrap 'exit 130' INT\ntrap 'exit 143' \
          TERM\ntrap 'exit 129' HUP\neval \"$(cat /dev/fd/{cmd_fd})\"\n__sp_rc=$?\nprintf %s \
-         \"$PWD\" >&{cwd_fd}\nexec 2>/dev/null\nexit \"$__sp_rc\"\n"
+         \"$PWD\" >&{pwd_fd}\nexec 2>/dev/null\nexit \"$__sp_rc\"\n"
     )
 }
 

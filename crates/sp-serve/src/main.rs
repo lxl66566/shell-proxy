@@ -9,7 +9,9 @@
 mod child;
 #[cfg(unix)]
 mod serve;
-#[cfg(unix)]
+// Pure bash-string templates with no libc dependency; compiled on every
+// platform under test so its assertions also run on Windows dev machines.
+#[cfg(any(unix, test))]
 mod wrapper;
 
 #[cfg(unix)]
