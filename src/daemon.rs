@@ -229,9 +229,10 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
         event_tx,
     ));
 
+    let mut reader_open = true;
     let outcome: std::result::Result<ExecOutcome, String> = loop {
         tokio::select! {
-            frame = sp_proto::read_exec_frame(&mut reader) => {
+            frame = sp_proto::read_exec_frame(&mut reader), if reader_open => {
                 match frame {
                     Ok(Some(ExecFrame::StdinData(d))) => {
                         if input_tx.send(InputEvent::Stdin(d)).await.is_err() {
@@ -255,7 +256,15 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
                         break Err("nested exec on one connection is not supported".into());
                     }
                     Ok(None) => {
-                        // Client vanished; give the remote side EOF, not a kill.
+                        // Client vanished; give the remote side EOF, not a kill,
+                        // and let it finish (cwd still updates). Polling an EOF
+                        // stream again would busy-loop.
+                        reader_open = false;
+                        warn!(
+                            "host={} client disconnected while the command was running; \
+                             letting it finish",
+                            req.host
+                        );
                         let _ = input_tx.send(InputEvent::StdinEof).await;
                     }
                     Err(e) => break Err(e.to_string()),
