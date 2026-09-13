@@ -7,7 +7,10 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use sp_proto::{EventFrame, ExecFrame, ExecRequest, ExitReport, Signal};
+use sp_proto::{
+    EventFrame, ExecFrame, ExecRequest, ExitReport, INTERNAL_ERROR_CODE, Signal, TIMEOUT_EXIT_CODE,
+    truncate_utf8,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     sync::mpsc,
@@ -23,13 +26,6 @@ const EXEC_WAIT: Duration = Duration::from_secs(30);
 /// are not lost while a hung orphan (e.g. `sleep 100 &`) cannot block us
 /// forever. Matches the behavior of the daemon-side implementation.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
-
-/// Exit code used when serve itself fails before/around the command; the
-/// daemon maps it to its internal-error code. Kept in sync with the daemon.
-const SERVE_ERROR_CODE: i32 = 254;
-
-/// Timed-out commands report 124, matching timeout(1).
-const TIMEOUT_EXIT_CODE: i32 = 124;
 
 /// Entry point: returns the process exit code.
 pub async fn run() -> i32 {
@@ -65,7 +61,7 @@ async fn inner() -> Result<()> {
         Ok(s) => s,
         Err(e) => {
             let report = ExitReport {
-                code: SERVE_ERROR_CODE,
+                code: INTERNAL_ERROR_CODE,
                 cwd: None,
                 error: Some(format!("spawn bash: {e}")),
                 timed_out: false,
@@ -324,6 +320,6 @@ fn abbrev(s: &str) -> String {
     if s.len() <= MAX {
         s.to_owned()
     } else {
-        format!("{}...(total {} bytes)", &s[..MAX], s.len())
+        format!("{}...(total {} bytes)", truncate_utf8(s, MAX), s.len())
     }
 }

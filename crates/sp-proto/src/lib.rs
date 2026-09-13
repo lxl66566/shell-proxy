@@ -28,6 +28,29 @@ pub enum Error {
 /// Protocol result.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Exit code for daemon/serve-side failures before/around the command
+/// (connect, auth, deploy, spawn). Shared by every hop.
+pub const INTERNAL_ERROR_CODE: i32 = 254;
+
+/// Exit code for timed-out commands, matching timeout(1).
+pub const TIMEOUT_EXIT_CODE: i32 = 124;
+
+/// Longest char-boundary-safe prefix of `s` within `max_bytes` bytes.
+///
+/// Plain slicing (`&s[..max]`) panics when the cut lands inside a multibyte
+/// char; log truncation must never kill a process.
+#[must_use]
+pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Signals the initiator can forward to the remote process group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -403,5 +426,22 @@ mod tests {
         let too_large = u32::try_from(MAX_PAYLOAD).unwrap() + 1;
         hdr.extend_from_slice(&too_large.to_le_bytes());
         assert!(dec.push(&hdr).is_err());
+    }
+
+    #[test]
+    fn truncate_utf8_cuts_on_char_boundaries() {
+        // 2 ASCII + one 3-byte char; max lands inside the multibyte char.
+        let s = "ab你cd";
+        assert_eq!(truncate_utf8(s, 10), s);
+        assert_eq!(truncate_utf8(s, 4), "ab"); // byte 4 is mid-char, falls back to 2
+        assert_eq!(truncate_utf8(s, 5), "ab你");
+        assert_eq!(truncate_utf8(s, 0), "");
+        assert_eq!(truncate_utf8("abc", 3), "abc");
+    }
+
+    #[test]
+    fn exit_codes_fit_u8() {
+        assert!(u8::try_from(INTERNAL_ERROR_CODE).is_ok());
+        assert!(u8::try_from(TIMEOUT_EXIT_CODE).is_ok());
     }
 }

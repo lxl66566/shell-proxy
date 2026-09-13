@@ -6,14 +6,14 @@ use clap::{CommandFactory, Parser, Subcommand};
 use shell_proxy::{
     client::{self, RunIo},
     config, console,
-    proto::{ExecRequest, Signal},
+    proto::{self, ExecRequest, Signal},
 };
 use tokio::sync::mpsc;
 
 /// Exit code for daemon/internal errors.
-const EXIT_INTERNAL: u8 = 254;
+const EXIT_INTERNAL: u8 = proto::INTERNAL_ERROR_CODE as u8;
 /// Exit code for timed-out commands, matching timeout(1).
-const EXIT_TIMEOUT: u8 = 124;
+const EXIT_TIMEOUT: u8 = proto::TIMEOUT_EXIT_CODE as u8;
 
 #[derive(Parser)]
 #[command(

@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sp_proto::{EventFrame, ExecFrame, ExecRequest, ExitReport, Pong};
+use sp_proto::{EventFrame, ExecFrame, ExecRequest, ExitReport, INTERNAL_ERROR_CODE, Pong};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{Mutex, mpsc},
@@ -179,7 +179,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
             warn!("connect host={} failed: {e}", req.host);
             let _ = out_tx
                 .send(EventFrame::Exit(ExitReport {
-                    code: 254,
+                    code: INTERNAL_ERROR_CODE,
                     cwd: None,
                     error: Some(e.brief()),
                     timed_out: false,
@@ -292,7 +292,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
             }
         },
         Err(msg) => ExitReport {
-            code: 254,
+            code: INTERNAL_ERROR_CODE,
             cwd: None,
             error: Some(msg),
             timed_out: false,
@@ -318,14 +318,11 @@ fn abbreviate(s: &str) -> String {
     if s.len() <= MAX {
         format!("{s:?}")
     } else {
-        // Truncate at a char boundary to keep the log line valid UTF-8.
-        let cut = s
-            .char_indices()
-            .map(|(i, _)| i)
-            .take_while(|i| *i <= MAX)
-            .last()
-            .unwrap_or(0);
-        format!("{:?}...(total {} bytes)", &s[..cut], s.len())
+        format!(
+            "{:?}...(total {} bytes)",
+            sp_proto::truncate_utf8(s, MAX),
+            s.len()
+        )
     }
 }
 
