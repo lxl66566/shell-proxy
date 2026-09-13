@@ -123,6 +123,14 @@ fn parse_ssh_g_output(host: &str, text: &str) -> Result<ResolvedHost> {
                     .map(|v| expand_tilde(&v))
                     .map(PathBuf::from),
             ),
+            // system-wide known_hosts (/etc/ssh/ssh_known_hosts, Windows
+            // ProgramData); consulted after the per-user files
+            "globalknownhostsfile" => known_hosts_files.extend(
+                split_values(value)
+                    .into_iter()
+                    .map(|v| expand_tilde(&v))
+                    .map(PathBuf::from),
+            ),
             "stricthostkeychecking" => {
                 strict_host_keys = !matches!(unquote(value).as_str(), "no" | "off" | "accept-new");
             },
@@ -250,7 +258,8 @@ port 22
 proxycommand none
 identityfile C:\\Users\\x\\.ssh\\id_rsa
 identityfile C:\\Users\\x\\.ssh\\id_ed25519
-userknownhostsfile C:\\Users\\x\\.ssh\\known_hosts C:\\ProgramData\\ssh\\ssh_known_hosts
+userknownhostsfile C:\\Users\\x\\.ssh\\known_hosts
+globalknownhostsfile C:\\ProgramData\\ssh\\ssh_known_hosts
 ";
         let r = parse_ssh_g_output("ls", text).unwrap();
         assert_eq!(r.hostname, "192.168.10.171");
