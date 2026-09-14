@@ -117,9 +117,36 @@ async fn run(
         cwd: cwd.map(str::to_owned),
         state: None,
         timeout_ms,
+        session: None,
     };
     let (_tx, rx) = mpsc::channel(1);
     client::run_captured(req, Vec::new(), rx).await
+}
+
+/// Like [`run`] but in a named session. Sessions use unique names per test
+/// run, so they never collide with the default bucket or previous runs.
+async fn run_in(
+    session: &str,
+    command: &str,
+    cwd: Option<&str>,
+    timeout_ms: Option<u64>,
+) -> shell_proxy::Result<(RunReport, Vec<u8>, Vec<u8>)> {
+    let req = ExecRequest {
+        host: harness().host.clone(),
+        command: command.to_owned(),
+        args: Vec::new(),
+        cwd: cwd.map(str::to_owned),
+        state: None,
+        timeout_ms,
+        session: Some(session.to_owned()),
+    };
+    let (_tx, rx) = mpsc::channel(1);
+    client::run_captured(req, Vec::new(), rx).await
+}
+
+/// Unique session name for a test (charset matches SessionId validation).
+fn unique_session(tag: &str) -> String {
+    format!("t-{tag}-{}", std::process::id())
 }
 
 fn out_str(v: &[u8]) -> String {
@@ -245,6 +272,7 @@ async fn stdin_forwarding() {
         cwd: None,
         state: None,
         timeout_ms: None,
+        session: None,
     };
     let (_tx, rx) = mpsc::channel(1);
     let (rep, out, _) = client::run_captured(req, b"line-one\nline-two\n".to_vec(), rx)
@@ -429,6 +457,7 @@ async fn sigint_forwards_to_remote() {
         cwd: None,
         state: None,
         timeout_ms: None,
+        session: None,
     };
     let (tx, rx) = mpsc::channel(1);
     let spawned = tokio::spawn(client::run_captured(req, Vec::new(), rx));
@@ -485,6 +514,7 @@ async fn daemon_error_surfaces_in_report() {
         cwd: None,
         state: None,
         timeout_ms: Some(10_000),
+        session: None,
     };
     let (_tx, rx) = mpsc::channel(1);
     let (rep, ..) = client::run_captured(req, Vec::new(), rx).await.unwrap();
@@ -529,11 +559,23 @@ async fn push_pull_roundtrip() {
     let mut payload = b"line-one\n\x00\xff\x01binary\n".to_vec();
     payload.extend_from_slice("你好，世界\n".as_bytes());
     let remote = format!("/tmp/sp-push-test-{}", std::process::id());
-    let up = client::upload_request(harness().host.clone(), &remote, None, None);
+    let up = client::upload_request(
+        harness().host.clone(),
+        shell_proxy::session::DEFAULT_NAME.to_owned(),
+        &remote,
+        None,
+        None,
+    );
     let (_tx, rx) = mpsc::channel(1);
     let (rep, ..) = client::run_captured(up, payload.clone(), rx).await.unwrap();
     assert_eq!(rep.code, 0, "push must succeed");
-    let down = client::download_request(harness().host.clone(), &remote, None, None);
+    let down = client::download_request(
+        harness().host.clone(),
+        shell_proxy::session::DEFAULT_NAME.to_owned(),
+        &remote,
+        None,
+        None,
+    );
     let (_tx, rx) = mpsc::channel(1);
     let (rep2, out, _) = client::run_captured(down, Vec::new(), rx).await.unwrap();
     assert_eq!(rep2.code, 0);
@@ -545,7 +587,13 @@ async fn push_pull_roundtrip() {
 async fn push_to_missing_dir_reports_error() {
     let Some(_g) = guard().await else { return };
     let remote = format!("/nonexistent-sp-test-{}/f", std::process::id());
-    let up = client::upload_request(harness().host.clone(), &remote, None, None);
+    let up = client::upload_request(
+        harness().host.clone(),
+        shell_proxy::session::DEFAULT_NAME.to_owned(),
+        &remote,
+        None,
+        None,
+    );
     let (_tx, rx) = mpsc::channel(1);
     let (rep, _, err) = client::run_captured(up, b"x".to_vec(), rx).await.unwrap();
     assert_ne!(rep.code, 0);
@@ -598,4 +646,104 @@ async fn cli_doctor_reports_remote() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("os: Linux"), "doctor output: {text}");
     assert!(text.contains("bash:"), "doctor output: {text}");
+}
+
+#[tokio::test]
+async fn sessions_isolate_cwd() {
+    let Some(_g) = guard().await else { return };
+    let a = unique_session("iso-cwd-a");
+    let b = unique_session("iso-cwd-b");
+    let (_, d_before, _) = run("pwd", None, None).await.unwrap();
+
+    run_in(&a, "cd /tmp", None, None).await.unwrap();
+    run_in(&b, "cd /usr", None, None).await.unwrap();
+    let (rep, out, _) = run_in(&a, "pwd", None, None).await.unwrap();
+    assert_eq!(rep.code, 0);
+    assert_eq!(out_str(&out).trim(), "/tmp");
+    let (rep, out, _) = run_in(&b, "pwd", None, None).await.unwrap();
+    assert_eq!(rep.code, 0);
+    assert_eq!(out_str(&out).trim(), "/usr");
+
+    // the default bucket is a third, independent state
+    let (_, d_after, _) = run("pwd", None, None).await.unwrap();
+    assert_eq!(out_str(&d_before), out_str(&d_after));
+}
+
+#[tokio::test]
+async fn sessions_isolate_state() {
+    let Some(_g) = guard().await else { return };
+    let a = unique_session("iso-st-a");
+    let b = unique_session("iso-st-b");
+
+    run_in(&a, "export SP_MARK=a", None, None).await.unwrap();
+    let (_, out, _) = run_in(&b, "echo [$SP_MARK]", None, None).await.unwrap();
+    assert_eq!(
+        out_str(&out).trim(),
+        "[]",
+        "session b must not see a's vars"
+    );
+
+    run_in(&b, "export SP_MARK=b", None, None).await.unwrap();
+    let (_, out, _) = run_in(&a, "echo $SP_MARK", None, None).await.unwrap();
+    assert_eq!(out_str(&out).trim(), "a", "b's export must not leak into a");
+}
+
+#[tokio::test]
+async fn sessions_execute_concurrently() {
+    let Some(_g) = guard().await else { return };
+    let a = unique_session("conc-a");
+    let b = unique_session("conc-b");
+    let started = Instant::now();
+    let fa = {
+        let a = a.clone();
+        tokio::spawn(async move { run_in(&a, "sleep 3; echo done-a", None, Some(30_000)).await })
+    };
+    let fb = {
+        let b = b.clone();
+        tokio::spawn(async move { run_in(&b, "sleep 3; echo done-b", None, Some(30_000)).await })
+    };
+    let (ra, rb) = tokio::join!(fa, fb);
+    let (rep_a, out_a, _) = ra.expect("task a").expect("exec a");
+    let (rep_b, out_b, _) = rb.expect("task b").expect("exec b");
+    assert_eq!(rep_a.code, 0);
+    assert_eq!(rep_b.code, 0);
+    assert_eq!(out_str(&out_a).trim(), "done-a");
+    assert_eq!(out_str(&out_b).trim(), "done-b");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "two sessions must run in parallel over one connection, took {:?}",
+        started.elapsed()
+    );
+}
+
+/// Killing the connection's sshd drops the SSH transport mid-command; the
+/// daemon evicts only the host connection and the session's cwd/state survive
+/// the reconnect (pre-session daemon lost them with the whole host state).
+#[tokio::test]
+async fn reconnect_preserves_session_state() {
+    let Some(_g) = guard().await else { return };
+    let s = unique_session("recon");
+    run_in(&s, "cd /tmp", None, None).await.unwrap();
+    // Kill the sshd serving this connection (parent of sp-serve, parent of
+    // the wrapper whose $PPID we see). The killing exec itself loses its
+    // channel before the exit report - that is the point.
+    let _ = run_in(&s, "kill $(ps -o ppid= -p $PPID)", None, Some(10_000)).await;
+    // The reconnect may race the dead-link detection in the daemon; allow the
+    // first attempt(s) to surface the dropped connection as an error.
+    let (rep, out, _) = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match run_in(&s, "pwd", None, Some(30_000)).await {
+                Ok(r) => break r,
+                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+    })
+    .await
+    .expect("reconnect must succeed eventually");
+    assert_eq!(rep.code, 0);
+    assert_eq!(
+        out_str(&out).trim(),
+        "/tmp",
+        "session cwd must survive the reconnect"
+    );
 }

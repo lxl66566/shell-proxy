@@ -7,6 +7,7 @@ use shell_proxy::{
     client::{self, RunIo, is_bare_word},
     config, console,
     proto::{self, ExecRequest, Signal},
+    session::SessionId,
 };
 use tokio::sync::mpsc;
 
@@ -31,6 +32,10 @@ struct Cli {
     /// Remote host alias (ssh config), overrides config/env
     #[arg(long, global = true)]
     host: Option<String>,
+
+    /// Session name: independent cwd/state per session on the same host
+    #[arg(long, global = true, value_parser = parse_session)]
+    session: Option<String>,
 
     /// Starting directory for this command (becomes the persisted cwd)
     #[arg(long, global = true)]
@@ -128,15 +133,30 @@ async fn async_main() -> ExitCode {
     }
 }
 
-/// Resolve the host or print the error and bail with the internal exit code.
-fn resolve_host_or_fail(cli: &Cli) -> Option<String> {
-    match config::resolve_host(cli.host.as_deref()) {
-        Ok(h) => Some(h),
-        Err(e) => {
-            eprintln!("sp: {e}");
-            None
-        },
-    }
+/// Resolve host and session (CLI arg > env > config/default) or print the
+/// error and bail with the internal exit code. Every exec-like subcommand
+/// resolves both the same way.
+fn resolve_target(cli: &Cli) -> Option<(String, String)> {
+    let fail = |e: shell_proxy::Error| {
+        eprintln!("sp: {e}");
+        None
+    };
+    let host = match config::resolve_host(cli.host.as_deref()) {
+        Ok(h) => h,
+        Err(e) => return fail(e),
+    };
+    let session = match config::resolve_session(cli.session.as_deref()) {
+        Ok(s) => s,
+        Err(e) => return fail(e),
+    };
+    Some((host, session.as_str().to_owned()))
+}
+
+/// clap value parser: reject invalid session names at argument-parsing time.
+fn parse_session(s: &str) -> Result<String, String> {
+    SessionId::parse(s)
+        .map(|_| s.to_owned())
+        .map_err(|e| e.to_string())
 }
 
 async fn run_command(cli: Cli) -> ExitCode {
@@ -152,7 +172,7 @@ async fn run_command(cli: Cli) -> ExitCode {
         },
     };
 
-    let Some(host) = resolve_host_or_fail(&cli) else {
+    let Some((host, session)) = resolve_target(&cli) else {
         return ExitCode::from(EXIT_INTERNAL);
     };
 
@@ -163,6 +183,7 @@ async fn run_command(cli: Cli) -> ExitCode {
         cwd: cli.cwd,
         state: None,
         timeout_ms: cli.timeout.map(timeout_ms),
+        session: Some(session),
     };
 
     // A terminal stdin is not forwarded (no TUI support): typing would compete
@@ -184,7 +205,7 @@ async fn run_command(cli: Cli) -> ExitCode {
 
 /// `sp push`: stream a local file (or stdin) into a remote path.
 async fn run_push(cli: &Cli, local: &std::path::Path, remote: &str) -> ExitCode {
-    let Some(host) = resolve_host_or_fail(cli) else {
+    let Some((host, session)) = resolve_target(cli) else {
         return ExitCode::from(EXIT_INTERNAL);
     };
     let stdin: Box<dyn tokio::io::AsyncRead + Send + Unpin> = if local.as_os_str() == "-" {
@@ -207,13 +228,19 @@ async fn run_push(cli: &Cli, local: &std::path::Path, remote: &str) -> ExitCode 
         stdout: Box::new(tokio::io::stdout()),
         stderr: Box::new(tokio::io::stderr()),
     };
-    let req = client::upload_request(host, remote, cli.cwd.clone(), cli.timeout.map(timeout_ms));
+    let req = client::upload_request(
+        host,
+        session,
+        remote,
+        cli.cwd.clone(),
+        cli.timeout.map(timeout_ms),
+    );
     exec_with_console(req, io).await
 }
 
 /// `sp pull`: stream a remote file to a local path (or stdout).
 async fn run_pull(cli: &Cli, remote: &str, local: &std::path::Path) -> ExitCode {
-    let Some(host) = resolve_host_or_fail(cli) else {
+    let Some((host, session)) = resolve_target(cli) else {
         return ExitCode::from(EXIT_INTERNAL);
     };
     let stdout: Box<dyn tokio::io::AsyncWrite + Send + Unpin> = if local.as_os_str() == "-" {
@@ -232,7 +259,13 @@ async fn run_pull(cli: &Cli, remote: &str, local: &std::path::Path) -> ExitCode 
         stdout,
         stderr: Box::new(tokio::io::stderr()),
     };
-    let req = client::download_request(host, remote, cli.cwd.clone(), cli.timeout.map(timeout_ms));
+    let req = client::download_request(
+        host,
+        session,
+        remote,
+        cli.cwd.clone(),
+        cli.timeout.map(timeout_ms),
+    );
     exec_with_console(req, io).await
 }
 
@@ -259,7 +292,7 @@ async fn run_doctor(cli: &Cli) -> ExitCode {
     } else {
         "config.toml"
     };
-    let Some(host) = resolve_host_or_fail(cli) else {
+    let Some((host, session)) = resolve_target(cli) else {
         return ExitCode::from(EXIT_INTERNAL);
     };
     println!("host: {host} (from {source})");
@@ -276,6 +309,7 @@ async fn run_doctor(cli: &Cli) -> ExitCode {
         cwd: cli.cwd.clone(),
         state: None,
         timeout_ms: Some(DOCTOR_TIMEOUT_MS),
+        session: Some(session),
     };
     let io = RunIo {
         stdin: Box::new(tokio::io::empty()),

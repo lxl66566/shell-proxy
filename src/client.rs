@@ -335,11 +335,13 @@ fn bare_char(c: char) -> bool {
 }
 
 /// Request that streams forwarded stdin into a remote file (`cat >`,
-/// truncates). The remote `cat` writes no stdout; its stderr and exit code
-/// carry any failure (missing parent directory, permissions).
+/// truncates) in the given session. The remote `cat` writes no stdout; its
+/// stderr and exit code carry any failure (missing parent directory,
+/// permissions).
 #[must_use]
 pub fn upload_request(
     host: String,
+    session: String,
     remote: &str,
     cwd: Option<String>,
     timeout_ms: Option<u64>,
@@ -351,13 +353,16 @@ pub fn upload_request(
         cwd,
         state: None,
         timeout_ms,
+        session: Some(session),
     }
 }
 
-/// Request that streams a remote file to captured stdout (`cat`).
+/// Request that streams a remote file (relative paths resolve against the
+/// session's persisted cwd) to captured stdout (`cat`).
 #[must_use]
 pub fn download_request(
     host: String,
+    session: String,
     remote: &str,
     cwd: Option<String>,
     timeout_ms: Option<u64>,
@@ -369,6 +374,7 @@ pub fn download_request(
         cwd,
         state: None,
         timeout_ms,
+        session: Some(session),
     }
 }
 

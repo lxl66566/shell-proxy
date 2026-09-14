@@ -13,6 +13,7 @@ Execute bash commands on a remote Linux machine.
 
 - stdout / stderr / stdin / pipes / exit codes / Ctrl+C are all forwarded faithfully
 - cwd + env persist across invocations
+- Multiple sessions: independent shell states (cwd/env) running in parallel on one host
 - The remote side runs an interactive bash that loads `~/.bashrc`
 - `sp push` / `sp pull` for file transfer; `sp -f` to run local scripts
 - Works as an MCP server for AI agents
@@ -37,11 +38,19 @@ sp --timeout 60 make           # exit code 124 on timeout
 sp push patch.py /tmp/x.py     # upload a file (local `-` reads stdin)
 sp pull /etc/os-release -      # download a file (local `-` writes stdout)
 sp doctor                      # diagnose local/daemon/remote environment
+
+# Sessions: --session (or the SP_SESSION env var) selects an independent
+# state bucket; cwd/env of different sessions on one host never mix, and
+# sessions run in parallel
+sp --session a cd /root && sp --session b cd /tmp
+sp --session a pwd             # -> /root
 ```
 
 Argument assembly: if a single argument contains shell syntax, it is passed verbatim to the remote bash; with multiple arguments, each is quoted and joined with spaces, so word boundaries are preserved. For complex scripts use `-f` or `cat script.sh | sp`.
 
 Exit codes: remote commands return as-is; 124 on timeout; 254 for daemon/connection errors.
+
+Session names match `[A-Za-z0-9._-]` and are at most 64 bytes; unspecified means `default`. Sessions live as long as the daemon: when it exits, state resets.
 
 ## Architecture
 
@@ -53,10 +62,15 @@ The daemon is started automatically if absent, and deploys the embedded `sp-serv
 
 ## MCP
 
-`sp mcp` serves three tools over stdio: `exec` / `read_file` / `write_file`. Command text goes straight to the remote bash, so there are no local shell quoting issues; cwd persists across invocations.
+`sp mcp` serves three tools over stdio: `exec` / `read_file` / `write_file`. Command text goes straight to the remote bash, so there are no local shell quoting issues; cwd persists across invocations. Every tool takes an optional `session` parameter to select an independent state bucket.
+
+For two AI agents working in parallel on the same host, pin one `SP_SESSION` each (one `sp mcp` process per agent, invisible to the agent):
 
 ```json
-{ "mcpServers": { "sp": { "command": "sp", "args": ["mcp"] } } }
+{ "mcpServers": {
+    "sp-a": { "command": "sp", "args": ["mcp"], "env": { "SP_SESSION": "agent-a" } },
+    "sp-b": { "command": "sp", "args": ["mcp"], "env": { "SP_SESSION": "agent-b" } }
+} }
 ```
 
 ## Configuration
@@ -68,9 +82,9 @@ host = "lse"       # default host alias
 log_level = "info"
 ```
 
-Priority: `--host` > `SP_HOST` > config.toml. Authentication prefers ssh-agent, then IdentityFile (add encrypted keys to your agent).
+Priority: `--host` > `SP_HOST` > config.toml; sessions: `--session` / tool parameter > `SP_SESSION` > `default`. Authentication prefers ssh-agent, then IdentityFile (add encrypted keys to your agent).
 
-Daemon logs live at `<config_dir>/shell-proxy/logs/daemon.log`, recording the time, host, cwd, exit code, duration, and command content for every command.
+Daemon logs live at `<config_dir>/shell-proxy/logs/daemon.log`, recording the time, host, session, cwd, exit code, duration, and command content for every command.
 
 ## Known limitations
 

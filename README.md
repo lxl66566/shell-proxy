@@ -13,6 +13,7 @@
 
 - stdout / stderr / stdin / 管道 / 退出码 / Ctrl+C 全部如实转发
 - cwd + env 在多次调用之间保持
+- 多 session：同一主机上并行多个独立 shell 状态（cwd/env），互不污染
 - 远端为交互式 bash，加载 `~/.bashrc`
 - `sp push` / `sp pull` 文件传输；`sp -f` 执行本地脚本
 - 可作为 MCP server 供 AI Agent 使用
@@ -37,11 +38,16 @@ sp --timeout 60 make           # 超时退出码 124
 sp push patch.py /tmp/x.py     # 上传文件（local 为 `-` 时读 stdin）
 sp pull /etc/os-release -      # 下载文件（local 为 `-` 时写 stdout）
 sp doctor                      # 诊断本地/daemon/远端环境
+
+# 多 session：--session（或环境变量 SP_SESSION）选择独立的状态桶
+sp --session a cd /root && sp --session b cd /tmp
 ```
 
 参数拼接：单参数含 shell 语法时整条原文交给远端 bash；多参数逐个引用后以空格拼接，词边界不丢。复杂脚本用 `-f` 或 `cat script.sh | sp`。
 
 退出码：远端命令原样返回；超时 124；daemon/连接错误 254。
+
+session 名限 `[A-Za-z0-9._-]`、最长 64 字节，不指定时为 `default`；session 生命周期与 daemon 一致，daemon 退出即回到初始状态。
 
 ## 架构
 
@@ -53,10 +59,17 @@ daemon 不存在时自动拉起，并在连接后自动部署内嵌的 `sp-serve
 
 ## MCP
 
-`sp mcp` 在 stdio 上提供 `exec` / `read_file` / `write_file` 三个工具。命令原文直达远端 bash，无本地 shell 引号问题；cwd 跨调用保持。
+`sp mcp` 在 stdio 上提供 `exec` / `read_file` / `write_file` 三个工具。命令原文直达远端 bash，无本地 shell 引号问题；cwd 跨调用保持。每个工具可选传 `session` 参数选择独立状态桶。
+
+两个 AI Agent 并行接入同一台机器时，各自固定一个 `SP_SESSION`（每个 agent 一个独立 `sp mcp` 进程，agent 无感知）：
 
 ```json
-{ "mcpServers": { "sp": { "command": "sp", "args": ["mcp"] } } }
+{
+  "mcpServers": {
+    "sp-a": { "command": "sp", "args": ["mcp"], "env": { "SP_SESSION": "agent-a" } },
+    "sp-b": { "command": "sp", "args": ["mcp"], "env": { "SP_SESSION": "agent-b" } }
+  }
+}
 ```
 
 ## 配置
@@ -68,9 +81,11 @@ host = "lse"       # 默认主机别名
 log_level = "info"
 ```
 
-优先级：`--host` > `SP_HOST` > config.toml。认证优先 ssh-agent，其次 IdentityFile（加密私钥请加入 agent）。
+优先级：`--host` > `SP_HOST` > config.toml；认证优先 ssh-agent，其次 IdentityFile（加密私钥请加入 agent）。
 
-daemon 日志位于 `<config_dir>/shell-proxy/logs/daemon.log`，记录每条命令的时间、主机、cwd、退出码、耗时与命令内容。
+session 优先级：`--session` / tool 参数 > `SP_SESSION` > `default`。
+
+daemon 日志位于 `<config_dir>/shell-proxy/logs/daemon.log`，记录每条命令的时间、主机、session、cwd、退出码、耗时与命令内容。
 
 ## 已知限制
 

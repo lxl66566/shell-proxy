@@ -107,6 +107,10 @@ pub struct ExecRequest {
     /// Kill the command after this many milliseconds; 0/None = unlimited.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Session name: the daemon routes persisted cwd/state by (host, session).
+    /// `None` means the default session. Ignored by `sp-serve`.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 /// Final report of one execution.
@@ -359,6 +363,7 @@ mod tests {
                 cwd: Some("/tmp".into()),
                 state: Some("declare -- x=1".into()),
                 timeout_ms: Some(5000),
+                session: Some("agent-a".into()),
             }),
             ExecFrame::StdinData(vec![0, 255, 10]),
             ExecFrame::StdinEof,
@@ -377,6 +382,7 @@ mod tests {
                     assert_eq!(a.command, b.command);
                     assert_eq!(a.state, b.state);
                     assert_eq!(a.timeout_ms, b.timeout_ms);
+                    assert_eq!(a.session, b.session);
                 },
                 (ExecFrame::StdinData(a), ExecFrame::StdinData(b)) => assert_eq!(a, b),
                 (ExecFrame::Signal(a), ExecFrame::Signal(b)) => assert_eq!(a, b),
@@ -440,6 +446,13 @@ mod tests {
         let too_large = u32::try_from(MAX_PAYLOAD).unwrap() + 1;
         hdr.extend_from_slice(&too_large.to_le_bytes());
         assert!(dec.push(&hdr).is_err());
+    }
+
+    #[test]
+    fn exec_request_without_session_field_is_none() {
+        // Wire compat: old clients never send `session`.
+        let req: ExecRequest = serde_json::from_str(r#"{"host":"ls","command":"true"}"#).unwrap();
+        assert_eq!(req.session, None);
     }
 
     #[test]

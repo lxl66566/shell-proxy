@@ -4,7 +4,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    session::SessionId,
+};
 
 /// Env var overriding the daemon socket path (mainly for tests).
 pub const ENV_SOCK: &str = "SP_SOCK";
@@ -14,6 +17,8 @@ pub const ENV_SOCK: &str = "SP_SOCK";
 pub const ENV_DAEMON_EXE: &str = "SP_DAEMON_EXE";
 /// Env var overriding the default host.
 pub const ENV_HOST: &str = "SP_HOST";
+/// Env var overriding the default session.
+pub const ENV_SESSION: &str = "SP_SESSION";
 
 /// Daemon log level; invalid values fail config parsing instead of silently
 /// falling back.
@@ -127,9 +132,27 @@ pub fn resolve_host(cli: Option<&str>) -> Result<String> {
         })
 }
 
+/// Resolve the effective session: CLI/tool arg > env > default.
+///
+/// Sessions are daemon-lifetime state, not persisted configuration, so there
+/// is no config.toml knob. An invalid value from any source is an error, not
+/// a silent fallback: a typo would silently split one session in two.
+pub fn resolve_session(cli: Option<&str>) -> Result<SessionId> {
+    if let Some(s) = cli {
+        return SessionId::parse(s).map_err(|e| Error::Config(format!("invalid session name: {e}")));
+    }
+    if let Ok(s) = std::env::var(ENV_SESSION)
+        && !s.is_empty()
+    {
+        return SessionId::parse(&s).map_err(|e| Error::Config(format!("{ENV_SESSION}: {e}")));
+    }
+    Ok(SessionId::default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::DEFAULT_NAME;
 
     #[test]
     fn app_dir_prefers_absolute_xdg() {
@@ -145,5 +168,30 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
         }
+    }
+
+    #[test]
+    fn resolve_session_precedence() {
+        // SAFETY: no other test in this binary touches SP_SESSION
+        unsafe { std::env::set_var(ENV_SESSION, "from-env") };
+        // CLI arg wins over env
+        assert_eq!(
+            resolve_session(Some("from-cli")).unwrap().as_str(),
+            "from-cli"
+        );
+        // env used when no CLI arg
+        assert_eq!(resolve_session(None).unwrap().as_str(), "from-env");
+        unsafe { std::env::remove_var(ENV_SESSION) };
+        // default when neither
+        assert_eq!(resolve_session(None).unwrap().as_str(), DEFAULT_NAME);
+    }
+
+    #[test]
+    fn resolve_session_rejects_invalid_input() {
+        assert!(resolve_session(Some("no spaces")).is_err());
+        // SAFETY: no other test in this binary touches SP_SESSION
+        unsafe { std::env::set_var(ENV_SESSION, "no/slashes") };
+        assert!(resolve_session(None).is_err());
+        unsafe { std::env::remove_var(ENV_SESSION) };
     }
 }

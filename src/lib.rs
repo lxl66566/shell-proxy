@@ -15,6 +15,7 @@ pub mod embed;
 pub mod error;
 pub mod mcp;
 pub mod remote;
+pub mod session;
 pub mod ssh;
 pub mod ssh_config;
 pub mod transport;

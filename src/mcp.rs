@@ -15,6 +15,7 @@ use crate::{
     client::{self, RunReport},
     config,
     proto::ExecRequest,
+    session::SessionId,
 };
 
 /// Default per-call timeout for MCP-driven executions.
@@ -29,22 +30,31 @@ struct ExecParams {
     /// 0 disables the timeout.
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// Session name: independent cwd/state per session on the same host.
+    #[serde(default)]
+    session: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReadFileParams {
-    /// Remote path; relative paths resolve against the persisted cwd.
+    /// Remote path; relative paths resolve against the session's persisted cwd.
     path: String,
+    /// Session name: independent cwd/state per session on the same host.
+    #[serde(default)]
+    session: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WriteFileParams {
-    /// Remote path; relative paths resolve against the persisted cwd.
+    /// Remote path; relative paths resolve against the session's persisted cwd.
     path: String,
     /// UTF-8 file content, written verbatim (truncates).
     content: String,
+    /// Session name: independent cwd/state per session on the same host.
+    #[serde(default)]
+    session: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -55,10 +65,12 @@ impl SpMcp {
     #[tool(
         description = "Execute a bash command on the remote Linux host. cwd and shell state \
                        (exported vars, shell vars, functions, aliases, umask) persist across \
-                       calls."
+                       calls within one session; pass `session` to keep parallel agents \
+                       independent."
     )]
     async fn exec(&self, params: Parameters<ExecParams>) -> Result<CallToolResult, McpError> {
         let host = resolve_host()?;
+        let session = resolve_session(params.0.session.as_deref())?;
         let req = ExecRequest {
             host,
             command: params.0.command,
@@ -66,6 +78,7 @@ impl SpMcp {
             cwd: params.0.cwd,
             state: None,
             timeout_ms: Some(params.0.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
+            session: Some(session.as_str().to_owned()),
         };
         let (report, stdout, stderr) = call(req, Vec::new()).await?;
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -79,7 +92,14 @@ impl SpMcp {
         params: Parameters<ReadFileParams>,
     ) -> Result<CallToolResult, McpError> {
         let host = resolve_host()?;
-        let req = client::download_request(host, &params.0.path, None, Some(DEFAULT_TIMEOUT_MS));
+        let session = resolve_session(params.0.session.as_deref())?;
+        let req = client::download_request(
+            host,
+            session.as_str().to_owned(),
+            &params.0.path,
+            None,
+            Some(DEFAULT_TIMEOUT_MS),
+        );
         let (report, stdout, stderr) = call(req, Vec::new()).await?;
         match file_result(&report, &stdout, &stderr) {
             Some(err) => Ok(CallToolResult::error(vec![ContentBlock::text(err)])),
@@ -95,7 +115,14 @@ impl SpMcp {
         params: Parameters<WriteFileParams>,
     ) -> Result<CallToolResult, McpError> {
         let host = resolve_host()?;
-        let req = client::upload_request(host, &params.0.path, None, Some(DEFAULT_TIMEOUT_MS));
+        let session = resolve_session(params.0.session.as_deref())?;
+        let req = client::upload_request(
+            host,
+            session.as_str().to_owned(),
+            &params.0.path,
+            None,
+            Some(DEFAULT_TIMEOUT_MS),
+        );
         let content = params.0.content;
         let len = content.len();
         let (report, _, stderr) = call(req, content.into_bytes()).await?;
@@ -111,6 +138,12 @@ impl SpMcp {
 
 fn resolve_host() -> Result<String, McpError> {
     config::resolve_host(None).map_err(|e| McpError::internal_error(e.brief(), None))
+}
+
+/// Tool arg > `SP_SESSION` env > default; an invalid name from either source
+/// is a caller error.
+fn resolve_session(cli: Option<&str>) -> Result<SessionId, McpError> {
+    config::resolve_session(cli).map_err(|e| McpError::invalid_params(e.brief(), None))
 }
 
 /// Run one request with captured streams; no signal forwarding (MCP has no

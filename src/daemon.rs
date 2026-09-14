@@ -1,6 +1,8 @@
-//! The resident daemon: owns persistent SSH connections per host, deploys
-//! `sp-serve`, serializes commands per host (cwd is shared state), streams
-//! output back over IPC and logs every execution.
+//! The resident daemon: owns one SSH connection and one `sp-serve` deployment
+//! per host (shared by every session there), keeps an independent cwd/state
+//! bucket per (host, session) (commands within a session serialize on it,
+//! sessions run in parallel), streams output back over IPC and logs every
+//! execution.
 
 use std::{
     collections::HashMap,
@@ -22,6 +24,7 @@ use crate::{
     config,
     error::{Error, Result},
     remote::{self, ExecOutcome, InputEvent, OutputEvent},
+    session::{self, SessionId},
     ssh::{self, SshConnection},
     ssh_config,
 };
@@ -36,22 +39,38 @@ const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 /// makes the remote side kill the process group and frees the host lock.
 const WATCHDOG_GRACE: Duration = Duration::from_secs(15);
 
-/// One host alias with its connection and persisted shell state.
-struct HostState {
+/// Host-level state: connection and deploy artifact, shared by every session
+/// on the host.
+struct HostConn {
     conn: SshConnection,
     /// Remote path of the deployed sp-serve binary.
     serve_path: String,
+}
+
+/// Session-level state: the persisted cwd and shell state of one
+/// (host, session) pair, plus the lock serializing its executions so state
+/// updates apply in order.
+struct SessionState {
     cwd: std::sync::Mutex<Option<String>>,
     /// Persisted shell state (bash source). Held as an opaque blob; the daemon
     /// never inspects or logs its contents - env values carry secrets.
     state: std::sync::Mutex<Option<String>>,
-    /// Serializes executions so state updates apply in order.
+    /// Serializes executions within this session; different sessions run in
+    /// parallel over the shared host connection.
     lock: Mutex<()>,
+}
+
+/// Key of a session bucket.
+#[derive(Hash, PartialEq, Eq)]
+struct SessionKey {
+    host: String,
+    session: SessionId,
 }
 
 #[derive(Default)]
 struct Shared {
-    hosts: Mutex<HashMap<String, Arc<HostState>>>,
+    hosts: Mutex<HashMap<String, Arc<HostConn>>>,
+    sessions: Mutex<HashMap<SessionKey, Arc<SessionState>>>,
 }
 
 /// Run the daemon until killed. Binds the IPC endpoint exclusively.
@@ -184,8 +203,27 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
     out_tx: &mpsc::Sender<EventFrame>,
 ) {
     let started = Instant::now();
-    let state = match get_or_connect(shared, &req.host).await {
+    // Defense in depth: clients validate session names too, but the daemon
+    // must not trust its IPC peers (the name enters logs and map keys).
+    let session = match SessionId::parse(req.session.as_deref().unwrap_or(session::DEFAULT_NAME)) {
         Ok(s) => s,
+        Err(e) => {
+            let msg = format!("invalid session name: {e}");
+            warn!("{msg}");
+            let _ = out_tx
+                .send(EventFrame::Exit(ExitReport {
+                    code: INTERNAL_ERROR_CODE,
+                    cwd: None,
+                    state: None,
+                    error: Some(msg),
+                    timed_out: false,
+                }))
+                .await;
+            return;
+        },
+    };
+    let conn = match get_or_connect(shared, &req.host).await {
+        Ok(c) => c,
         Err(e) => {
             warn!("connect host={} failed: {e}", req.host);
             let _ = out_tx
@@ -200,17 +238,18 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
             return;
         },
     };
-    let _guard = state.lock.lock().await;
+    let sess = get_session(shared, &req.host, &session).await;
+    let _guard = sess.lock.lock().await;
     let start_cwd = req
         .cwd
         .clone()
-        .or_else(|| state.cwd.lock().expect("cwd lock").clone());
+        .or_else(|| sess.cwd.lock().expect("cwd lock").clone());
 
     let mut eff_req = req.clone();
     eff_req.cwd = start_cwd.clone();
     eff_req
         .state
-        .clone_from(&state.state.lock().expect("state lock"));
+        .clone_from(&sess.state.lock().expect("state lock"));
 
     let (input_tx, input_rx) = mpsc::channel::<InputEvent>(64);
     let (event_tx, mut event_rx) = mpsc::channel::<OutputEvent>(256);
@@ -242,8 +281,8 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
         // and dropping the engine also closes the exec channel, letting the
         // remote side clean up when we abandon the execution.
         let mut engine = std::pin::pin!(remote::execute(
-            state.conn.handle(),
-            &state.serve_path,
+            conn.conn.handle(),
+            &conn.serve_path,
             &eff_req,
             input_rx,
             event_tx,
@@ -321,9 +360,14 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
     let _ = bridge.await;
 
     // A dead connection cannot be retried transparently (forwarded stdin is
-    // gone), so evict the state; the next command reconnects on its own.
-    if outcome.is_err() && state.conn.is_closed() {
-        warn!("host={} connection lost, evicting state", req.host);
+    // gone), so drop the host entry; the next command reconnects on its own.
+    // Session buckets survive the eviction: cwd/state are strings tied to
+    // the session, not the connection, and resume after the reconnect.
+    if outcome.is_err() && conn.conn.is_closed() {
+        warn!(
+            "host={} connection lost, evicting connection (sessions keep their state)",
+            req.host
+        );
         shared.hosts.lock().await.remove(&req.host);
     }
 
@@ -332,10 +376,10 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
         Ok(o) => {
             state_bytes = o.new_state.as_deref().map_or(0, str::len);
             if let Some(cwd) = &o.new_cwd {
-                *state.cwd.lock().expect("cwd lock") = Some(cwd.clone());
+                *sess.cwd.lock().expect("cwd lock") = Some(cwd.clone());
             }
             if let Some(s) = &o.new_state {
-                *state.state.lock().expect("state lock") = Some(s.clone());
+                *sess.state.lock().expect("state lock") = Some(s.clone());
             }
             ExitReport {
                 code: o.exit_code,
@@ -357,8 +401,9 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
     };
 
     info!(
-        "exec host={} cwd={} rc={} dur={}ms out={}B err={}B state={}B cmd={}",
+        "exec host={} session={} cwd={} rc={} dur={}ms out={}B err={}B state={}B cmd={}",
         req.host,
+        session,
         start_cwd.as_deref().unwrap_or("~"),
         report.code,
         started.elapsed().as_millis(),
@@ -390,33 +435,49 @@ fn abbreviate(s: &str) -> String {
 /// connect to one host must not block commands to already-connected hosts.
 /// On a connect race the losing connection is dropped; the winner's state
 /// stays in the map.
-async fn get_or_connect(shared: &Arc<Shared>, host: &str) -> Result<Arc<HostState>> {
-    let live = |hosts: &HashMap<String, Arc<HostState>>| {
-        hosts.get(host).filter(|s| !s.conn.is_closed()).cloned()
+async fn get_or_connect(shared: &Arc<Shared>, host: &str) -> Result<Arc<HostConn>> {
+    let live = |hosts: &HashMap<String, Arc<HostConn>>| {
+        hosts.get(host).filter(|c| !c.conn.is_closed()).cloned()
     };
-    if let Some(state) = live(&*shared.hosts.lock().await) {
-        return Ok(state);
+    if let Some(conn) = live(&*shared.hosts.lock().await) {
+        return Ok(conn);
     }
-    let state = connect_state(host).await?;
+    let conn = connect_host(host).await?;
     let mut hosts = shared.hosts.lock().await;
     if let Some(existing) = live(&hosts) {
         return Ok(existing); // another task connected first; keep the winner
     }
-    hosts.insert(host.to_owned(), Arc::clone(&state));
-    Ok(state)
+    hosts.insert(host.to_owned(), Arc::clone(&conn));
+    Ok(conn)
 }
 
-async fn connect_state(host: &str) -> Result<Arc<HostState>> {
+async fn connect_host(host: &str) -> Result<Arc<HostConn>> {
     let resolved = ssh_config::resolve(host).await?;
     let conn = ssh::connect(resolved).await?;
     let serve_path = remote::deploy(conn.handle()).await?;
-    Ok(Arc::new(HostState {
-        conn,
-        serve_path,
-        cwd: std::sync::Mutex::new(None),
-        state: std::sync::Mutex::new(None),
-        lock: Mutex::new(()),
-    }))
+    Ok(Arc::new(HostConn { conn, serve_path }))
+}
+
+/// Get the state bucket of one (host, session), creating it on first use.
+/// The table lock is a short critical section; buckets are never removed:
+/// each holds two bounded strings and the daemon lifetime bounds the count.
+async fn get_session(shared: &Arc<Shared>, host: &str, session: &SessionId) -> Arc<SessionState> {
+    let key = SessionKey {
+        host: host.to_owned(),
+        session: session.clone(),
+    };
+    let mut sessions = shared.sessions.lock().await;
+    sessions
+        .entry(key)
+        .or_insert_with(|| {
+            debug!("session created host={host} session={session}");
+            Arc::new(SessionState {
+                cwd: std::sync::Mutex::new(None),
+                state: std::sync::Mutex::new(None),
+                lock: Mutex::new(()),
+            })
+        })
+        .clone()
 }
 
 // -- logging -----------------------------------------------------------------
