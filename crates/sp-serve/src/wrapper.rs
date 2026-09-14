@@ -4,10 +4,10 @@
 //! through inherited fds, environment variables or argv - never through string
 //! interpolation into shell syntax, so there is no escaping layer to get wrong.
 //!
-//! Known limitation: the report/dump pipe fds are inherited by everything the
-//! command spawns, so a surviving background job (`foo &`) holds the write end
-//! open - EOF never arrives and serve keeps the previous cwd/state after the
-//! drain grace period.
+//! The report/dump pipe fds are inherited by everything the command spawns, so
+//! a surviving background job (`nohup foo &`) holds their write ends open and
+//! EOF never arrives; both reports therefore end with a NUL terminator, which
+//! serve treats as the completion signal instead of EOF.
 
 /// rcfile body read by `bash -i` at startup.
 ///
@@ -34,10 +34,12 @@ pub fn rc_body(stderr_fd: i32) -> String {
 /// - the command text is read verbatim from `cmd_fd` and `eval`ed in this shell, so `sp cd ...`
 ///   mutates the working directory we report;
 /// - after the command, the final `$PWD` is written to `pwd_fd` and the state dump to `dump_fd`
-///   (both out of band, stdout stays byte-clean), and the command's exit status is propagated.
-///   SP_CWD (daemon-provided, stale after a user `--cwd`) and PWD (owned by the cd mechanism;
-///   restoring a stale string would desync `$PWD` from the real directory) are kept out of the
-///   dump; OLDPWD stays so `cd -` works across commands;
+///   (both out of band, stdout stays byte-clean; both NUL-terminated - bash data can never contain
+///   NUL, and a background job surviving the command holds the pipe write ends open, so serve must
+///   not wait for EOF), and the command's exit status is propagated. SP_CWD (daemon-provided, stale
+///   after a user `--cwd`) and PWD (owned by the cd mechanism; restoring a stale string would
+///   desync `$PWD` from the real directory) are kept out of the dump; OLDPWD stays so `cd -` works
+///   across commands;
 /// - the dump is all builtins, no fork: declare/alias/shopt/set/umask read in-memory tables, and
 ///   `declare -p` output is one safely quoted line per variable, so it round-trips through eval as
 ///   data, not syntax;
@@ -50,9 +52,9 @@ pub fn wrapper_body(cmd_fd: i32, restore_fd: i32, dump_fd: i32, pwd_fd: i32) -> 
         "if [ -n \"${{SP_CWD:-}}\" ]; then\n  cd -- \"$SP_CWD\" || {{ printf 'sp: cannot cd to \
          %s, using HOME\\n' \"$SP_CWD\" >&2; cd; }}\nfi\ntrap 'exit 130' INT\ntrap 'exit 143' \
          TERM\ntrap 'exit 129' HUP\n{{ eval \"$(cat /dev/fd/{restore_fd})\"; }} 2>/dev/null\neval \
-         \"$(cat /dev/fd/{cmd_fd})\"\n__sp_rc=$?\nset +e\nprintf %s \"$PWD\" >&{pwd_fd}\nexec \
-         2>/dev/null\nunset SP_CWD PWD\n{{ declare -p; declare -f; alias; shopt -p; set +o; umask \
-         -p; }} >&{dump_fd}\nexit \"$__sp_rc\"\n"
+         \"$(cat /dev/fd/{cmd_fd})\"\n__sp_rc=$?\nset +e\nprintf '%s\\0' \"$PWD\" \
+         >&{pwd_fd}\nexec 2>/dev/null\nunset SP_CWD PWD\n{{ declare -p; declare -f; alias; shopt \
+         -p; set +o; umask -p; printf '\\0'; }} >&{dump_fd}\nexit \"$__sp_rc\"\n"
     )
 }
 
@@ -70,7 +72,7 @@ mod tests {
         let w = wrapper_body(9, 10, 12, 11);
         assert!(w.contains("eval \"$(cat /dev/fd/9)\""));
         assert!(w.contains("eval \"$(cat /dev/fd/10)\""));
-        assert!(w.contains("printf %s \"$PWD\" >&11"));
+        assert!(w.contains(">&11"));
         assert!(w.contains(">&12"));
         // traps must pin 128+signum exit codes
         assert!(w.contains("trap 'exit 130' INT"));
@@ -78,7 +80,7 @@ mod tests {
         assert!(w.contains("trap 'exit 129' HUP"));
         // errexit must be off before the reports run
         let rc_capture = w.find("__sp_rc=$?").expect("rc captured");
-        let report = w.find("printf %s \"$PWD\"").expect("pwd report");
+        let report = w.find("printf '%s\\0' \"$PWD\"").expect("pwd report");
         assert!(
             w[rc_capture..report].contains("set +e"),
             "set +e must sit between rc capture and the reports"
@@ -104,5 +106,14 @@ mod tests {
         assert!(unset < dump);
         // OLDPWD is not excluded: cd - across commands depends on it
         assert!(!w.contains("OLDPWD"));
+    }
+
+    #[test]
+    fn reports_end_with_nul_terminator() {
+        // A surviving background job holds the report pipes open, so serve
+        // must rely on the terminator, not EOF, to know a report is complete.
+        let w = wrapper_body(9, 10, 12, 11);
+        assert!(w.contains("printf '%s\\0' \"$PWD\" >&11"));
+        assert!(w.contains("umask -p; printf '\\0'; } >&12"));
     }
 }

@@ -341,6 +341,84 @@ async fn timeout_kills_command() {
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
+/// A detached job (own session via setsid, so serve's group kill cannot reach
+/// it) that keeps the session's stderr write end open forever: the exit report
+/// must still arrive within serve's bounded drain instead of waiting for EOF.
+#[tokio::test]
+async fn orphan_holding_pipes_does_not_wedge_the_host() {
+    let Some(_g) = guard().await else { return };
+    let started = Instant::now();
+    let res = tokio::time::timeout(
+        Duration::from_secs(30),
+        run(
+            "setsid sh -c 'sleep 120 >&2' >/dev/null & echo ok",
+            None,
+            None,
+        ),
+    )
+    .await;
+    // Cleanup runs under its own bound: if the bug regressed, the wedged exec
+    // still holds the host lock and even this must not hang the test run.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(15),
+        run("pkill -f 'sleep 120' 2>/dev/null; true", None, None),
+    )
+    .await;
+    let (rep, out, _) = res
+        .expect("exec must finish while the orphan lives")
+        .unwrap();
+    assert_eq!(rep.code, 0);
+    assert_eq!(out_str(&out).trim(), "ok");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "orphan-held pipes must not stall the exit report"
+    );
+    // The host lock must be free again: the next command answers promptly.
+    let t = Instant::now();
+    let (rep2, out2, _) = run("echo alive", None, None).await.unwrap();
+    assert_eq!(rep2.code, 0);
+    assert_eq!(out_str(&out2).trim(), "alive");
+    assert!(t.elapsed() < Duration::from_secs(10));
+}
+
+/// cd and exported state must persist even when a surviving background job
+/// holds the report pipes open: the reports are NUL-terminated, so serve does
+/// not depend on EOF to collect them.
+#[tokio::test]
+async fn state_persists_with_surviving_background_job() {
+    let Some(_g) = guard().await else { return };
+    let res = tokio::time::timeout(
+        Duration::from_secs(30),
+        run(
+            "cd /tmp; setsid sh -c 'sleep 120 >&2' >/dev/null & export SP_BG_MARK=1",
+            None,
+            None,
+        ),
+    )
+    .await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(15),
+        run("pkill -f 'sleep 120' 2>/dev/null; true", None, None),
+    )
+    .await;
+    let (rep, ..) = res
+        .expect("exec must finish while the orphan lives")
+        .unwrap();
+    assert_eq!(rep.code, 0);
+    assert_eq!(
+        rep.cwd.as_deref(),
+        Some("/tmp"),
+        "cwd report must arrive despite the orphan"
+    );
+    let (_, out, _) = run("echo \"[$SP_BG_MARK] $(pwd)\"", None, None)
+        .await
+        .unwrap();
+    let text = out_str(&out);
+    assert!(text.contains("[1]"), "exported var must persist: {text}");
+    assert!(text.contains("/tmp"), "cwd must persist: {text}");
+    run("cd /root; unset SP_BG_MARK", None, None).await.unwrap();
+}
+
 #[tokio::test]
 async fn sigint_forwards_to_remote() {
     let Some(_g) = guard().await else { return };

@@ -23,8 +23,9 @@ use crate::child::{self, Spawned};
 const EXEC_WAIT: Duration = Duration::from_secs(30);
 
 /// How long to keep draining child pipes after the exit status, so tail bytes
-/// are not lost while a hung orphan (e.g. `sleep 100 &`) cannot block us
-/// forever. Matches the behavior of the daemon-side implementation.
+/// are not lost. A job surviving the command (`nohup ... &`) inherits the
+/// pipes and never EOFs; past the grace the pumps are aborted and any further
+/// output is dropped.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Grace between the timeout TERM and the escalating KILL, so remote cleanup
@@ -119,8 +120,8 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
         let _ = dead_tx.send(());
     });
 
-    let out_pump = pump(stdout, EventFrame::Stdout, out_tx.clone());
-    let err_pump = pump(stderr, EventFrame::Stderr, out_tx.clone());
+    let mut out_pump = pump(stdout, EventFrame::Stdout, out_tx.clone());
+    let mut err_pump = pump(stderr, EventFrame::Stderr, out_tx.clone());
     let cwd_collect = tokio::spawn(read_pipe(cwd, CWD_CAP, "cwd report"));
     let state_collect = tokio::spawn(read_pipe(state, STATE_CAP, "state dump"));
 
@@ -262,24 +263,34 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
     route.abort();
 
     let code = status_code(&status);
-    // Drain tail output; orphans holding the pipes open must not block us.
-    let _ = tokio::time::timeout(DRAIN_GRACE, async move {
-        let _ = out_pump.await;
-        let _ = err_pump.await;
+    // Drain tail output. Orphaned jobs holding the pipes open must not block
+    // us: past the grace the pumps are aborted, not merely detached - a
+    // detached pump keeps its writer sender alive, so the writer (and the Exit
+    // frame behind it) would wait on a channel that cannot close until the
+    // last orphan exits.
+    if tokio::time::timeout(DRAIN_GRACE, async {
+        let _ = (&mut out_pump).await;
+        let _ = (&mut err_pump).await;
     })
-    .await;
+    .await
+    .is_err()
+    {
+        log("drain grace elapsed with output pipes still open (orphan job?); dropping tail");
+        out_pump.abort();
+        err_pump.abort();
+    }
     let new_cwd = match tokio::time::timeout(DRAIN_GRACE, cwd_collect).await {
         Ok(Ok(Some(cwd))) => Some(cwd),
         Ok(Ok(None)) => None,
         _ => {
-            log("cwd report not fully read (orphan holds the pipe?); cwd unchanged");
+            log("cwd report did not terminate in time; cwd unchanged");
             None
         },
     };
     let new_state = match tokio::time::timeout(DRAIN_GRACE, state_collect).await {
         Ok(Ok(state)) => state,
         _ => {
-            log("state dump not fully read (orphan holds the pipe?); state unchanged");
+            log("state dump did not terminate in time; state unchanged");
             None
         },
     };
@@ -296,6 +307,9 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
         timed_out,
     };
     log(&format!("exit rc={} timed_out={timed_out}", report.code));
+    // Every sender is gone now (route aborted, pumps finished or aborted), so
+    // the writer flushes queued frames and exits; then the Exit frame goes out
+    // in order behind them.
     drop(out_tx);
     let _ = writer.await;
     write_exit(&report).await?;
@@ -323,11 +337,17 @@ enum StdinMsg {
     Eof,
 }
 
-/// Read an out-of-band report pipe to the end. `None` means "nothing to
-/// update": empty pipe (the wrapper `exec`ed away), invalid UTF-8, or `cap`
-/// exceeded (garbage guard; overflow is logged, the caller keeps the previous
-/// value). On overflow the pipe is still drained to EOF so the writer never
-/// sees EPIPE/SIGPIPE - the child must keep its real exit code.
+/// Read an out-of-band report pipe to its NUL terminator.
+///
+/// The wrapper ends both reports with a NUL byte (bash data can never contain
+/// one), so a surviving background job holding the write end open cannot stall
+/// the read: the terminator, not EOF, is the completion signal. EOF without a
+/// terminator (the wrapper `exec`ed away or was killed) still yields whatever
+/// bytes arrived. `None` means "nothing to update": empty report, invalid
+/// UTF-8, or `cap` exceeded (garbage guard; overflow is logged, the caller
+/// keeps the previous value). On overflow the pipe is still drained to EOF so
+/// a mid-write wrapper never sees EPIPE - the child must keep its real exit
+/// code.
 async fn read_pipe(
     mut r: tokio::net::unix::pipe::Receiver,
     cap: usize,
@@ -341,6 +361,10 @@ async fn read_pipe(
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 if !overflow {
+                    if let Some(pos) = chunk[..n].iter().position(|&b| b == 0) {
+                        buf.extend_from_slice(&chunk[..pos]);
+                        break;
+                    }
                     buf.extend_from_slice(&chunk[..n]);
                     if buf.len() > cap {
                         overflow = true;
@@ -349,6 +373,7 @@ async fn read_pipe(
                         ));
                     }
                 }
+                // Overflow: keep draining silently so the writer stays alive.
             },
         }
     }

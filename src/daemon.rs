@@ -29,6 +29,13 @@ use crate::{
 /// Log files above this size are rotated to `.old` at daemon startup.
 const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 
+/// Extra slack over the request timeout before the daemon stops waiting for an
+/// exit report: covers serve's TERM-to-KILL escalation, its bounded pipe
+/// drains and frame latency, so only a genuinely wedged serve (or transport)
+/// trips the watchdog. Dropping the engine then closes the exec channel, which
+/// makes the remote side kill the process group and frees the host lock.
+const WATCHDOG_GRACE: Duration = Duration::from_secs(15);
+
 /// One host alias with its connection and persisted shell state.
 struct HostState {
     conn: SshConnection,
@@ -229,59 +236,83 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
         }
     });
 
-    let mut engine = std::pin::pin!(remote::execute(
-        state.conn.handle(),
-        &state.serve_path,
-        &eff_req,
-        input_rx,
-        event_tx,
-    ));
+    let outcome: std::result::Result<ExecOutcome, String> = {
+        // Scoped so the engine future is dropped before the bridge is joined
+        // below: the bridge ends only once the engine's event sender is gone,
+        // and dropping the engine also closes the exec channel, letting the
+        // remote side clean up when we abandon the execution.
+        let mut engine = std::pin::pin!(remote::execute(
+            state.conn.handle(),
+            &state.serve_path,
+            &eff_req,
+            input_rx,
+            event_tx,
+        ));
 
-    let mut reader_open = true;
-    let outcome: std::result::Result<ExecOutcome, String> = loop {
-        tokio::select! {
-            frame = sp_proto::read_exec_frame(&mut reader), if reader_open => {
-                match frame {
-                    Ok(Some(ExecFrame::StdinData(d))) => {
-                        if input_tx.send(InputEvent::Stdin(d)).await.is_err() {
-                            break Err("engine died unexpectedly".into());
+        let mut reader_open = true;
+        // Watchdog: serve enforces timeout_ms itself (TERM then KILL) and its
+        // drains are bounded, so a healthy execution always reports before
+        // this fires; unlimited requests opt out. Without it one wedged
+        // execution would queue every later command on the host lock forever.
+        let watchdog = eff_req
+            .timeout_ms
+            .filter(|ms| *ms > 0)
+            .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms) + WATCHDOG_GRACE);
+        let far = tokio::time::Instant::now() + Duration::from_secs(86_400 * 365);
+        let watchdog_at = watchdog.unwrap_or(far);
+
+        loop {
+            tokio::select! {
+                frame = sp_proto::read_exec_frame(&mut reader), if reader_open => {
+                    match frame {
+                        Ok(Some(ExecFrame::StdinData(d))) => {
+                            if input_tx.send(InputEvent::Stdin(d)).await.is_err() {
+                                break Err("engine died unexpectedly".into());
+                            }
                         }
+                        Ok(Some(ExecFrame::StdinEof)) => {
+                            let _ = input_tx.send(InputEvent::StdinEof).await;
+                        }
+                        Ok(Some(ExecFrame::Signal(s))) => {
+                            info!("forwarding signal {} to engine", s.as_str());
+                            let _ = input_tx.send(InputEvent::Signal(s)).await;
+                        }
+                        Ok(Some(ExecFrame::Ping)) => {
+                            let _ = out_tx
+                                .send(EventFrame::Pong(Pong { pid: std::process::id() }))
+                                .await;
+                        }
+                        Ok(Some(ExecFrame::Exec(_))) => {
+                            let _ = input_tx.send(InputEvent::StdinEof).await;
+                            break Err("nested exec on one connection is not supported".into());
+                        }
+                        Ok(None) => {
+                            // Client vanished; give the remote side EOF, not a kill,
+                            // and let it finish (cwd still updates). Polling an EOF
+                            // stream again would busy-loop.
+                            reader_open = false;
+                            warn!(
+                                "host={} client disconnected while the command was running; \
+                                 letting it finish",
+                                req.host
+                            );
+                            let _ = input_tx.send(InputEvent::StdinEof).await;
+                        }
+                        Err(e) => break Err(e.to_string()),
                     }
-                    Ok(Some(ExecFrame::StdinEof)) => {
-                        let _ = input_tx.send(InputEvent::StdinEof).await;
-                    }
-                    Ok(Some(ExecFrame::Signal(s))) => {
-                        info!("forwarding signal {} to engine", s.as_str());
-                        let _ = input_tx.send(InputEvent::Signal(s)).await;
-                    }
-                    Ok(Some(ExecFrame::Ping)) => {
-                        let _ = out_tx
-                            .send(EventFrame::Pong(Pong { pid: std::process::id() }))
-                            .await;
-                    }
-                    Ok(Some(ExecFrame::Exec(_))) => {
-                        let _ = input_tx.send(InputEvent::StdinEof).await;
-                        break Err("nested exec on one connection is not supported".into());
-                    }
-                    Ok(None) => {
-                        // Client vanished; give the remote side EOF, not a kill,
-                        // and let it finish (cwd still updates). Polling an EOF
-                        // stream again would busy-loop.
-                        reader_open = false;
-                        warn!(
-                            "host={} client disconnected while the command was running; \
-                             letting it finish",
-                            req.host
-                        );
-                        let _ = input_tx.send(InputEvent::StdinEof).await;
-                    }
-                    Err(e) => break Err(e.to_string()),
                 }
-            }
-            res = &mut engine => {
-                match res {
-                    Ok(outcome) => break Ok(outcome),
-                    Err(e) => break Err(e.brief()),
+                res = &mut engine => {
+                    match res {
+                        Ok(outcome) => break Ok(outcome),
+                        Err(e) => break Err(e.brief()),
+                    }
+                }
+                () = tokio::time::sleep_until(watchdog_at), if watchdog.is_some() => {
+                    break Err(format!(
+                        "watchdog: no exit report within {}ms; the exec channel was closed, see \
+                         the daemon log for sp-serve diagnostics",
+                        eff_req.timeout_ms.unwrap_or_default(),
+                    ));
                 }
             }
         }
