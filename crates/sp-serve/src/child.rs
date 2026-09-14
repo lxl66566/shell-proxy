@@ -9,7 +9,9 @@
 //! | 2  | /dev/null until the rcfile restores it | real stderr pipe, inherited |
 //! | N  | rcfile memfd (`--rcfile /dev/fd/N`) | serve |
 //! | M  | command text memfd (`eval "$(cat /dev/fd/M)"`) | serve |
+//! | R  | shell state restore memfd (`eval "$(cat /dev/fd/R)"`) | serve |
 //! | K  | cwd report (`printf %s "$PWD" >&K`) | pipe to serve |
+//! | D  | shell state dump (`{ declare -p; ... } >&D`) | pipe to serve |
 //!
 //! All dynamic content travels through inherited fds/argv/env, so no string
 //! the user controls is ever parsed as shell syntax by our layer. The child is
@@ -39,6 +41,8 @@ pub struct Spawned {
     pub stderr: pipe::Receiver,
     /// Cwd report channel: the wrapper writes the final `$PWD` here.
     pub cwd: pipe::Receiver,
+    /// State dump channel: the wrapper writes the post-command shell state.
+    pub state: pipe::Receiver,
 }
 
 /// Spawn the bash wrapper for one request.
@@ -47,18 +51,23 @@ pub fn spawn(req: &ExecRequest) -> io::Result<Spawned> {
     let (stdout_w, stdout_r) = pipe::pipe()?;
     let (stderr_w, stderr_r) = pipe::pipe()?;
     let (cwd_w, cwd_r) = pipe::pipe()?;
+    let (state_w, state_r) = pipe::pipe()?;
 
     let in_fd = stdin_r.as_raw_fd();
     let out_fd = stdout_w.as_raw_fd();
     let err_fd = stderr_w.as_raw_fd();
     let cwd_fd = cwd_w.as_raw_fd();
+    let dump_fd = state_w.as_raw_fd();
 
     // memfd: anonymous in-memory files, no filesystem leftovers. CLOEXEC is
-    // cleared for the child in pre_exec.
+    // cleared for the child in pre_exec. The restore memfd is empty content
+    // when no state exists - the wrapper's eval of "" is a no-op.
     let rc_file = memfd(c"sp-rcfile", wrapper::rc_body(err_fd).as_bytes())?;
     let cmd_file = memfd(c"sp-cmd", req.command.as_bytes())?;
+    let state_file = memfd(c"sp-state", req.state.as_deref().unwrap_or("").as_bytes())?;
     let rc_fd = rc_file.as_raw_fd();
     let cmd_fd = cmd_file.as_raw_fd();
+    let restore_fd = state_file.as_raw_fd();
 
     let mut cmd = Command::new("bash");
     cmd.arg("--noprofile")
@@ -66,7 +75,7 @@ pub fn spawn(req: &ExecRequest) -> io::Result<Spawned> {
         .arg(format!("/dev/fd/{rc_fd}"))
         .arg("-i")
         .arg("-c")
-        .arg(wrapper::wrapper_body(cmd_fd, cwd_fd))
+        .arg(wrapper::wrapper_body(cmd_fd, restore_fd, dump_fd, cwd_fd))
         // $0 named bash so error messages match a plain bash session.
         .arg("bash")
         .args(&req.args);
@@ -98,7 +107,7 @@ pub fn spawn(req: &ExecRequest) -> io::Result<Spawned> {
             if libc::dup2(out_fd, 1) < 0 {
                 return Err(io::Error::last_os_error());
             }
-            for fd in [in_fd, out_fd, err_fd, cwd_fd] {
+            for fd in [in_fd, out_fd, err_fd, cwd_fd, dump_fd] {
                 let flags = libc::fcntl(fd, libc::F_GETFL);
                 if flags < 0 {
                     return Err(io::Error::last_os_error());
@@ -107,8 +116,9 @@ pub fn spawn(req: &ExecRequest) -> io::Result<Spawned> {
                     return Err(io::Error::last_os_error());
                 }
             }
-            // Let the rcfile/command memfds and the stderr/cwd pipes survive exec.
-            for fd in [rc_fd, cmd_fd, err_fd, cwd_fd] {
+            // Let the rcfile/command/state memfds and the stderr/cwd/state
+            // pipes survive exec.
+            for fd in [rc_fd, cmd_fd, restore_fd, err_fd, cwd_fd, dump_fd] {
                 if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -124,8 +134,10 @@ pub fn spawn(req: &ExecRequest) -> io::Result<Spawned> {
     drop(stdout_w);
     drop(stderr_w);
     drop(cwd_w);
+    drop(state_w);
     drop(rc_file);
     drop(cmd_file);
+    drop(state_file);
 
     Ok(Spawned {
         child,
@@ -133,6 +145,7 @@ pub fn spawn(req: &ExecRequest) -> io::Result<Spawned> {
         stdout: stdout_r,
         stderr: stderr_r,
         cwd: cwd_r,
+        state: state_r,
     })
 }
 

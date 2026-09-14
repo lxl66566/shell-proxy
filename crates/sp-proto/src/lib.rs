@@ -99,6 +99,11 @@ pub struct ExecRequest {
     /// Starting cwd for this call; `sp-serve` cds there before running.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Persisted shell state (vars/functions/aliases/options) as bash source,
+    /// eval'd after the bashrc and the cd, before the command. Daemon-owned;
+    /// same lifecycle as `cwd`.
+    #[serde(default)]
+    pub state: Option<String>,
     /// Kill the command after this many milliseconds; 0/None = unlimited.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
@@ -111,6 +116,11 @@ pub struct ExitReport {
     /// cwd after the command, when the wrapper reported it.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Shell state dump after the command, when the wrapper reported one.
+    /// `None` means "no update" (command exec'ed away, was killed, or the dump
+    /// exceeded the size cap); the caller keeps the previous state.
+    #[serde(default)]
+    pub state: Option<String>,
     /// Daemon/serve-side failure before/while running (auth, connect, ...).
     #[serde(default)]
     pub error: Option<String>,
@@ -347,6 +357,7 @@ mod tests {
                 command: "echo 'a'".into(),
                 args: vec!["x y".into()],
                 cwd: Some("/tmp".into()),
+                state: Some("declare -- x=1".into()),
                 timeout_ms: Some(5000),
             }),
             ExecFrame::StdinData(vec![0, 255, 10]),
@@ -364,6 +375,7 @@ mod tests {
             match (f, &got) {
                 (ExecFrame::Exec(a), ExecFrame::Exec(b)) => {
                     assert_eq!(a.command, b.command);
+                    assert_eq!(a.state, b.state);
                     assert_eq!(a.timeout_ms, b.timeout_ms);
                 },
                 (ExecFrame::StdinData(a), ExecFrame::StdinData(b)) => assert_eq!(a, b),
@@ -381,6 +393,7 @@ mod tests {
         let f = EventFrame::Exit(ExitReport {
             code: 130,
             cwd: Some("/r".into()),
+            state: Some("declare -- x=1".into()),
             error: None,
             timed_out: false,
         });
@@ -391,6 +404,7 @@ mod tests {
             EventFrame::Exit(r) => {
                 assert_eq!(r.code, 130);
                 assert_eq!(r.cwd.as_deref(), Some("/r"));
+                assert_eq!(r.state.as_deref(), Some("declare -- x=1"));
             },
             _ => panic!("wrong frame"),
         }

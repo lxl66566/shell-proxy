@@ -31,6 +31,14 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// handlers (traps, make/gradle shutdown hooks) get a chance to run.
 const TERM_GRACE: Duration = Duration::from_secs(5);
 
+/// Cap for the cwd report; anything beyond a path is garbage.
+const CWD_CAP: usize = 8 * 1024;
+/// Cap for the shell state dump; a user command can build huge variables, and
+/// an unbounded dump would balloon the Exit frame and daemon memory. Overflow
+/// keeps the previous state (logged) and the pipe is drained, not cut, so the
+/// child's exit code is untouched.
+const STATE_CAP: usize = 256 * 1024;
+
 /// Entry point: returns the process exit code.
 pub async fn run() -> i32 {
     match inner().await {
@@ -67,6 +75,7 @@ async fn inner() -> Result<()> {
             let report = ExitReport {
                 code: INTERNAL_ERROR_CODE,
                 cwd: None,
+                state: None,
                 error: Some(format!("spawn bash: {e}")),
                 timed_out: false,
             };
@@ -86,6 +95,7 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
         stdout,
         stderr,
         cwd,
+        state,
     } = spawned;
     let pgid = child
         .id()
@@ -111,7 +121,8 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
 
     let out_pump = pump(stdout, EventFrame::Stdout, out_tx.clone());
     let err_pump = pump(stderr, EventFrame::Stderr, out_tx.clone());
-    let cwd_collect = tokio::spawn(read_cwd(cwd));
+    let cwd_collect = tokio::spawn(read_pipe(cwd, CWD_CAP, "cwd report"));
+    let state_collect = tokio::spawn(read_pipe(state, STATE_CAP, "state dump"));
 
     // Child stdin writer: a closed channel (Eof, or a broken child pipe) drops
     // the write end, which is what sends EOF to the child.
@@ -265,6 +276,13 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
             None
         },
     };
+    let new_state = match tokio::time::timeout(DRAIN_GRACE, state_collect).await {
+        Ok(Ok(state)) => state,
+        _ => {
+            log("state dump not fully read (orphan holds the pipe?); state unchanged");
+            None
+        },
+    };
 
     let report = ExitReport {
         code: if timed_out {
@@ -273,6 +291,7 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
             code
         },
         cwd: new_cwd,
+        state: new_state,
         error: None,
         timed_out,
     };
@@ -304,26 +323,50 @@ enum StdinMsg {
     Eof,
 }
 
-/// Read the cwd pipe to the end; empty (wrapper `exec`ed away) means None.
-async fn read_cwd(mut r: tokio::net::unix::pipe::Receiver) -> Option<String> {
+/// Read an out-of-band report pipe to the end. `None` means "nothing to
+/// update": empty pipe (the wrapper `exec`ed away), invalid UTF-8, or `cap`
+/// exceeded (garbage guard; overflow is logged, the caller keeps the previous
+/// value). On overflow the pipe is still drained to EOF so the writer never
+/// sees EPIPE/SIGPIPE - the child must keep its real exit code.
+async fn read_pipe(
+    mut r: tokio::net::unix::pipe::Receiver,
+    cap: usize,
+    what: &str,
+) -> Option<String> {
     let mut buf = Vec::new();
-    // A cwd is a path; anything beyond 8 KiB is garbage.
+    let mut overflow = false;
     let mut chunk = [0u8; 4096];
     loop {
         match r.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.len() > 8192 {
-                    return None;
+                if !overflow {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > cap {
+                        overflow = true;
+                        log(&format!(
+                            "{what} exceeded {cap} bytes, keeping previous value"
+                        ));
+                    }
                 }
             },
         }
     }
+    if overflow {
+        return None;
+    }
     if buf.is_empty() {
         return None;
     }
-    String::from_utf8(buf).ok().filter(|s| !s.is_empty())
+    match String::from_utf8(buf) {
+        Ok(s) if !s.is_empty() => Some(s),
+        _ => {
+            log(&format!(
+                "{what} is not valid UTF-8, keeping previous value"
+            ));
+            None
+        },
+    }
 }
 
 /// Forward one child pipe to frame output until EOF.

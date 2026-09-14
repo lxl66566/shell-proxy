@@ -35,7 +35,10 @@ struct HostState {
     /// Remote path of the deployed sp-serve binary.
     serve_path: String,
     cwd: std::sync::Mutex<Option<String>>,
-    /// Serializes executions so cwd updates apply in order.
+    /// Persisted shell state (bash source). Held as an opaque blob; the daemon
+    /// never inspects or logs its contents - env values carry secrets.
+    state: std::sync::Mutex<Option<String>>,
+    /// Serializes executions so state updates apply in order.
     lock: Mutex<()>,
 }
 
@@ -182,6 +185,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
                 .send(EventFrame::Exit(ExitReport {
                     code: INTERNAL_ERROR_CODE,
                     cwd: None,
+                    state: None,
                     error: Some(e.brief()),
                     timed_out: false,
                 }))
@@ -197,6 +201,9 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
 
     let mut eff_req = req.clone();
     eff_req.cwd = start_cwd.clone();
+    eff_req
+        .state
+        .clone_from(&state.state.lock().expect("state lock"));
 
     let (input_tx, input_rx) = mpsc::channel::<InputEvent>(64);
     let (event_tx, mut event_rx) = mpsc::channel::<OutputEvent>(256);
@@ -289,14 +296,22 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
         shared.hosts.lock().await.remove(&req.host);
     }
 
+    let mut state_bytes = 0usize;
     let report = match outcome {
         Ok(o) => {
+            state_bytes = o.new_state.as_deref().map_or(0, str::len);
             if let Some(cwd) = &o.new_cwd {
                 *state.cwd.lock().expect("cwd lock") = Some(cwd.clone());
+            }
+            if let Some(s) = &o.new_state {
+                *state.state.lock().expect("state lock") = Some(s.clone());
             }
             ExitReport {
                 code: o.exit_code,
                 cwd: o.new_cwd,
+                // The client cannot use the state blob; only its size is
+                // interesting and that goes to the log below.
+                state: None,
                 error: None,
                 timed_out: o.timed_out,
             }
@@ -304,19 +319,21 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
         Err(msg) => ExitReport {
             code: INTERNAL_ERROR_CODE,
             cwd: None,
+            state: None,
             error: Some(msg),
             timed_out: false,
         },
     };
 
     info!(
-        "exec host={} cwd={} rc={} dur={}ms out={}B err={}B cmd={}",
+        "exec host={} cwd={} rc={} dur={}ms out={}B err={}B state={}B cmd={}",
         req.host,
         start_cwd.as_deref().unwrap_or("~"),
         report.code,
         started.elapsed().as_millis(),
         stdout_bytes.load(Ordering::Relaxed),
         stderr_bytes.load(Ordering::Relaxed),
+        state_bytes,
         abbreviate(&req.command),
     );
 
@@ -366,6 +383,7 @@ async fn connect_state(host: &str) -> Result<Arc<HostState>> {
         conn,
         serve_path,
         cwd: std::sync::Mutex::new(None),
+        state: std::sync::Mutex::new(None),
         lock: Mutex::new(()),
     }))
 }

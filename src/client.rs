@@ -349,6 +349,7 @@ pub fn upload_request(
         command: format!("cat > {}", shell_quote(remote)),
         args: Vec::new(),
         cwd,
+        state: None,
         timeout_ms,
     }
 }
@@ -366,6 +367,7 @@ pub fn download_request(
         command: format!("cat {}", shell_quote(remote)),
         args: Vec::new(),
         cwd,
+        state: None,
         timeout_ms,
     }
 }

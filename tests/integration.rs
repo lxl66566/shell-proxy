@@ -115,6 +115,7 @@ async fn run(
         command: command.to_owned(),
         args: Vec::new(),
         cwd: cwd.map(str::to_owned),
+        state: None,
         timeout_ms,
     };
     let (_tx, rx) = mpsc::channel(1);
@@ -242,6 +243,7 @@ async fn stdin_forwarding() {
         command: "cat".into(),
         args: vec![],
         cwd: None,
+        state: None,
         timeout_ms: None,
     };
     let (_tx, rx) = mpsc::channel(1);
@@ -271,6 +273,65 @@ async fn cwd_persists_across_calls() {
 }
 
 #[tokio::test]
+async fn shell_state_persists_across_calls() {
+    let Some(_g) = guard().await else { return };
+    // exported var
+    run("export SP_STATE_MARK=hello", None, None).await.unwrap();
+    let (rep, out, _) = run("echo [$SP_STATE_MARK]", None, None).await.unwrap();
+    assert_eq!(rep.code, 0);
+    assert_eq!(out_str(&out), "[hello]\n");
+    // plain shell var
+    run("sp_plain_var=42", None, None).await.unwrap();
+    let (_, out, _) = run("echo $sp_plain_var", None, None).await.unwrap();
+    assert_eq!(out_str(&out), "42\n");
+    // function
+    run("sp_fn() { echo fn-$1; }", None, None).await.unwrap();
+    let (rep, out, _) = run("sp_fn ok", None, None).await.unwrap();
+    assert_eq!(rep.code, 0);
+    assert_eq!(out_str(&out), "fn-ok\n");
+    // alias (expansion happens after the restore, before the command)
+    run("alias spal='echo alias-works'", None, None)
+        .await
+        .unwrap();
+    let (rep, out, _) = run("spal", None, None).await.unwrap();
+    assert_eq!(rep.code, 0);
+    assert_eq!(out_str(&out), "alias-works\n");
+    // umask and OLDPWD-backed cd -
+    run("umask 077; cd /tmp", None, None).await.unwrap();
+    run("cd /usr", None, None).await.unwrap();
+    let (_, out, _) = run("cd - >/dev/null && pwd && umask", None, None)
+        .await
+        .unwrap();
+    let lines = out_str(&out);
+    assert!(
+        lines.contains("/tmp"),
+        "cd - should return to /tmp: {lines}"
+    );
+    assert!(lines.contains("0077"), "umask should persist: {lines}");
+    // cleanup: fresh state via unset (next dump drops them)
+    run(
+        "unset SP_STATE_MARK sp_plain_var sp_fn; unalias spal; umask 022",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn state_updates_take_latest_value() {
+    let Some(_g) = guard().await else { return };
+    // re-export overwrites the persisted value; unset removes it
+    run("export SP_PATH_MARK=1", None, None).await.unwrap();
+    run("export SP_PATH_MARK=2", None, None).await.unwrap();
+    let (_, out, _) = run("echo $SP_PATH_MARK", None, None).await.unwrap();
+    assert_eq!(out_str(&out), "2\n");
+    run("unset SP_PATH_MARK", None, None).await.unwrap();
+    let (_, out, _) = run("echo [$SP_PATH_MARK]", None, None).await.unwrap();
+    assert_eq!(out_str(&out), "[]\n");
+}
+
+#[tokio::test]
 async fn timeout_kills_command() {
     let Some(_g) = guard().await else { return };
     let started = Instant::now();
@@ -288,6 +349,7 @@ async fn sigint_forwards_to_remote() {
         command: "sleep 60".into(),
         args: vec![],
         cwd: None,
+        state: None,
         timeout_ms: None,
     };
     let (tx, rx) = mpsc::channel(1);
@@ -343,6 +405,7 @@ async fn daemon_error_surfaces_in_report() {
         command: "true".into(),
         args: vec![],
         cwd: None,
+        state: None,
         timeout_ms: Some(10_000),
     };
     let (_tx, rx) = mpsc::channel(1);

@@ -53,7 +53,9 @@ struct SpMcp;
 #[tool_router]
 impl SpMcp {
     #[tool(
-        description = "Execute a bash command on the remote Linux host. cwd persists across calls."
+        description = "Execute a bash command on the remote Linux host. cwd and shell state \
+                       (exported vars, shell vars, functions, aliases, umask) persist across \
+                       calls."
     )]
     async fn exec(&self, params: Parameters<ExecParams>) -> Result<CallToolResult, McpError> {
         let host = resolve_host()?;
@@ -62,6 +64,7 @@ impl SpMcp {
             command: params.0.command,
             args: Vec::new(),
             cwd: params.0.cwd,
+            state: None,
             timeout_ms: Some(params.0.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
         };
         let (report, stdout, stderr) = call(req, Vec::new()).await?;
@@ -176,9 +179,6 @@ fn format_report(report: &RunReport, stdout: &[u8], stderr: &[u8]) -> String {
     let _ = writeln!(out, "exit_code: {}", report.code);
     if let Some(e) = &report.error {
         let _ = writeln!(out, "error: {e}");
-    }
-    if let Some(cwd) = &report.cwd {
-        let _ = writeln!(out, "cwd: {cwd}");
     }
     if report.timed_out {
         let _ = writeln!(out, "timed_out: true");

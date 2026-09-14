@@ -161,6 +161,7 @@ async fn run_command(cli: Cli) -> ExitCode {
         command,
         args,
         cwd: cli.cwd,
+        state: None,
         timeout_ms: cli.timeout.map(timeout_ms),
     };
 
@@ -273,6 +274,7 @@ async fn run_doctor(cli: &Cli) -> ExitCode {
         command: r#"echo "os: $(uname -srm)"; echo "bash: $(bash --version | head -1)"; echo "home: $HOME"; echo "cwd: $PWD""#.into(),
         args: Vec::new(),
         cwd: cli.cwd.clone(),
+        state: None,
         timeout_ms: Some(DOCTOR_TIMEOUT_MS),
     };
     let io = RunIo {
@@ -335,12 +337,7 @@ fn build_command(cli: &Cli) -> shell_proxy::Result<Option<(String, Vec<String>)>
         {
             return Ok(Some((only.to_string_lossy().into_owned(), Vec::new())));
         }
-        let joined = cmd_args()
-            .iter()
-            .map(|s| client::shell_quote(s))
-            .collect::<Vec<_>>()
-            .join(" ");
-        return Ok(Some((joined, Vec::new())));
+        return Ok(Some((join_command(&cmd_args()), Vec::new())));
     }
     if !std::io::stdin().is_terminal() {
         let mut script = String::new();
@@ -352,50 +349,47 @@ fn build_command(cli: &Cli) -> shell_proxy::Result<Option<(String, Vec<String>)>
     Ok(None)
 }
 
+/// A single arg is a whole command line and must reach the remote bash
+/// verbatim (`sp "a | b"` would break if quoted). Multiple args arrive
+/// shell-dequoted from the local shell; re-quote each one so the remote bash
+/// parses the joined line back into the same words (`sp echo "a b"` stays one
+/// remote argument).
+fn join_command(args: &[String]) -> String {
+    match args {
+        [single] => single.clone(),
+        many => many
+            .iter()
+            .map(|s| client::shell_quote(s))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-
-    use super::{Cli, build_command};
-
-    fn cli_cmd(args: &[&str]) -> Cli {
-        Cli {
-            host: None,
-            cwd: None,
-            timeout: None,
-            file: None,
-            sub: None,
-            cmd: args.iter().map(OsString::from).collect(),
-        }
-    }
-
-    fn built(args: &[&str]) -> String {
-        build_command(&cli_cmd(args)).unwrap().expect("command").0
-    }
+    use super::join_command;
 
     #[test]
-    fn lone_quoted_line_runs_verbatim() {
-        assert_eq!(built(&["echo 1"]), "echo 1");
-        assert_eq!(built(&["echo 333 | grep 3"]), "echo 333 | grep 3");
-        assert_eq!(built(&["cd /tmp && pwd"]), "cd /tmp && pwd");
-        // Locally quoted operators stay live shell syntax, not literal words.
-        assert_eq!(built(&["ls|wc"]), "ls|wc");
-    }
-
-    #[test]
-    fn multiple_args_keep_word_boundaries() {
-        assert_eq!(built(&["echo", "a b"]), "echo 'a b'");
-        assert_eq!(built(&["grep", "a b", "f.txt"]), "grep 'a b' f.txt");
+    fn single_arg_is_verbatim() {
+        // Quoting a lone arg would turn the whole line into one command name.
         assert_eq!(
-            built(&["bash", "-c", "cd /x && ls"]),
-            "bash -c 'cd /x && ls'"
+            join_command(&["echo $X | grep 3".into()]),
+            "echo $X | grep 3"
         );
+        assert_eq!(join_command(&["ls".into()]), "ls");
     }
 
     #[test]
-    fn lone_bare_word_stays_a_word() {
-        assert_eq!(built(&["ls"]), "ls");
-        assert_eq!(built(&["definitely_missing"]), "definitely_missing");
-        assert_eq!(built(&["/root/x.sh"]), "/root/x.sh");
+    fn joins_multiple_quoted_args() {
+        assert_eq!(join_command(&["ls".into(), "-alF".into()]), "ls -alF");
+        assert_eq!(join_command(&["echo".into(), "a b".into()]), "echo 'a b'");
+    }
+
+    #[test]
+    fn quotes_embedded_quotes() {
+        assert_eq!(
+            join_command(&["echo".into(), "it's".into()]),
+            "echo 'it'\\''s'"
+        );
     }
 }
