@@ -41,6 +41,15 @@ const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 /// the host lock.
 const WATCHDOG_GRACE: Duration = Duration::from_secs(15);
 
+/// Overall budget for first contact with a host: the ssh connect (whose
+/// transport, handshake and authentication stages each carry their own finer
+/// timeouts in the ssh layer) plus the sp-serve deploy it triggers (arch
+/// probe, checksum, upload - plain exec channels no ssh-layer timeout
+/// covers). Bounds callers that cannot interrupt themselves (MCP) and CLI
+/// requests without a timeout. Cancelling mid-deploy can leave an orphaned
+/// `.upload-*` temp file; the next deploy's stale cleanup removes it.
+const CONNECT_DEPLOY_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// `Instant::now() + d`, checked. A bare `+` panics on clock overflow and
 /// release builds abort, which one oversized request must never do to the
 /// resident daemon; `None` degrades the caller to "no deadline". The entry
@@ -546,6 +555,9 @@ fn abbreviate(s: &str) -> String {
 /// connect to one host must not block commands to already-connected hosts.
 /// On a connect race the losing connection is dropped; the winner's state
 /// stays in the map.
+///
+/// A fresh connect, including the deploy inside it, runs under
+/// [`CONNECT_DEPLOY_TIMEOUT`] - cached connections skip the bound entirely.
 async fn get_or_connect(shared: &Arc<Shared>, host: &str) -> Result<Arc<HostConn>> {
     let live = |hosts: &HashMap<String, Arc<HostConn>>| {
         hosts.get(host).filter(|c| !c.conn.is_closed()).cloned()
@@ -553,7 +565,18 @@ async fn get_or_connect(shared: &Arc<Shared>, host: &str) -> Result<Arc<HostConn
     if let Some(conn) = live(&*shared.hosts.lock().await) {
         return Ok(conn);
     }
-    let conn = connect_host(host).await?;
+    let attempt = connect_host(host);
+    let conn = match deadline_after(CONNECT_DEPLOY_TIMEOUT) {
+        // Two `?`: the timeout's Elapsed, then the connect error itself.
+        Some(at) => tokio::time::timeout_at(at, attempt).await.map_err(|_| {
+            Error::Connect(format!(
+                "host {host}: connect or deploy did not complete within {}s",
+                CONNECT_DEPLOY_TIMEOUT.as_secs()
+            ))
+        })??,
+        // Clock overflow: unreachable for this constant, degrade to unbounded.
+        None => attempt.await?,
+    };
     let mut hosts = shared.hosts.lock().await;
     if let Some(existing) = live(&hosts) {
         return Ok(existing); // another task connected first; keep the winner

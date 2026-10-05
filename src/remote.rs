@@ -41,6 +41,24 @@ const FORWARDER_CLOSE: Duration = Duration::from_secs(2);
 /// dropped mid-run; whatever is still stuck after this is aborted.
 const TASK_REAP: Duration = Duration::from_secs(5);
 
+/// Bound for each pre-engine setup step of [`execute`]: opening the exec
+/// channel, the SSH exec request and the initial sp-proto Exec frame. The
+/// daemon-side watchdog covers only the engine loop and only when the request
+/// carries a timeout, so without this bound a wedged transport would park an
+/// unlimited request before the engine even starts. Timing out fails the
+/// whole execution; the dropped channel may then carry a half-written frame,
+/// but nobody decodes it after that failure.
+const EXEC_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout error for one pre-engine setup step, stage-named and host-tagged
+/// so the client report points at the stuck phase.
+fn exec_setup_timeout(stage: &str, host: &str) -> Error {
+    Error::Remote(format!(
+        "host {host}: {stage} did not complete within {}s",
+        EXEC_SETUP_TIMEOUT.as_secs()
+    ))
+}
+
 /// Events on the daemon-to-engine stdin lane. `Eof` is an ordered frame: it
 /// must reach the remote behind all data, so it travels on the same lane
 /// instead of being expressed as a channel close.
@@ -171,19 +189,20 @@ pub async fn execute(
     mut signals: mpsc::Receiver<Signal>,
     output: mpsc::Sender<OutputEvent>,
 ) -> Result<ExecOutcome> {
-    let channel = handle
-        .channel_open_session()
+    let channel = timeout(EXEC_SETUP_TIMEOUT, handle.channel_open_session())
         .await
+        .map_err(|_| exec_setup_timeout("open exec channel", &req.host))?
         .map_err(|e| Error::Remote(format!("open exec channel: {e}")))?;
-    channel
-        .exec(false, serve_path)
+    timeout(EXEC_SETUP_TIMEOUT, channel.exec(false, serve_path))
         .await
+        .map_err(|_| exec_setup_timeout("exec request", &req.host))?
         .map_err(|e| Error::Remote(format!("request exec {serve_path}: {e}")))?;
     let (mut reader, writer) = channel.split();
 
-    writer
-        .data_bytes(sp_proto::encode_exec_frame(&ExecFrame::Exec(req.clone()))?)
+    let exec_frame = sp_proto::encode_exec_frame(&ExecFrame::Exec(req.clone()))?;
+    timeout(EXEC_SETUP_TIMEOUT, writer.data_bytes(exec_frame))
         .await
+        .map_err(|_| exec_setup_timeout("send Exec frame", &req.host))?
         .map_err(|e| Error::Remote(format!("send Exec frame: {e}")))?;
 
     let (shutdown, shutdown_rx) = Shutdown::new();
