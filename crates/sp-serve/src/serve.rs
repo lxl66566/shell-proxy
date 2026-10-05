@@ -125,9 +125,11 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
     let cwd_collect = tokio::spawn(read_pipe(cwd, CWD_CAP, "cwd report"));
     let state_collect = tokio::spawn(read_pipe(state, STATE_CAP, "state dump"));
 
-    // Child stdin writer: a closed channel (Eof, or a broken child pipe) drops
-    // the write end, which is what sends EOF to the child.
-    let (stdin_tx, mut stdin_rx) = mpsc::channel::<StdinMsg>(256);
+    // Child stdin pump: the only writer of the child's stdin pipe, always
+    // awaiting its writes (backpressure without drops or busy-waiting). The
+    // channel closing (Eof, or a broken child pipe) drops the write end,
+    // which is what sends EOF to the child.
+    let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<StdinMsg>();
     tokio::spawn(async move {
         let mut w = child_stdin;
         while let Some(m) = stdin_rx.recv().await {
@@ -142,11 +144,13 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
         }
     });
 
-    // Transport reader. Stdin data is forwarded with a bounded await: when the
-    // child stops reading, the SSH window closes and the producer on the
-    // client side blocks - backpressure end to end instead of dropped data.
-    // Control frames are routed to the main loop so signal handling never
-    // waits behind this task's own awaits.
+    // Transport reader. Stdin data is handed to the pump over an unbounded
+    // channel, so the hand-off never awaits: a child that stopped reading
+    // stdin must not be able to starve the control-frame routing below -
+    // Ctrl+C has to reach kill_group exactly when the command is wedged on a
+    // full stdin pipe. The price is buffering undeliverable stdin in memory
+    // (bounded by what the daemon pushes while the child stalls); blocking
+    // here or dropping the data would both be worse.
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Ctrl>(16);
     let ping_tx = out_tx.clone();
     let route = tokio::spawn(async move {
@@ -157,12 +161,12 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
         loop {
             match sp_proto::read_exec_frame(&mut stdin).await {
                 Ok(Some(ExecFrame::StdinData(d))) => {
-                    if stdin_tx.send(StdinMsg::Data(d)).await.is_err() {
-                        break; // child stdin writer gone (child exited)
+                    if stdin_tx.send(StdinMsg::Data(d)).is_err() {
+                        break; // stdin pump gone (child exited)
                     }
                 },
                 Ok(Some(ExecFrame::StdinEof)) => {
-                    if stdin_tx.send(StdinMsg::Eof).await.is_err() {
+                    if stdin_tx.send(StdinMsg::Eof).is_err() {
                         break;
                     }
                 },
