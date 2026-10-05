@@ -1,7 +1,10 @@
 //! SSH connection: transport (direct or ProxyCommand), host key verification,
 //! authentication (agent first, then identity files) and keepalives.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use russh::{
     client::{self, Handle},
@@ -49,47 +52,114 @@ impl client::Handler for ClientHandler {
         let port = self.resolved.port;
         // Real files only: `ssh -G` emits /dev/null and platform placeholders
         // (e.g. __PROGRAMDATA__) that must be skipped, plus missing defaults.
-        let files: Vec<_> = self
+        let files: Vec<&Path> = self
             .resolved
             .known_hosts_files
             .iter()
             .filter(|p| p.as_os_str() != "/dev/null" && p.is_file())
+            .map(PathBuf::as_path)
             .collect();
-        for path in &files {
-            match check_known_hosts_path(host, port, &server_public_key, path) {
-                Ok(true) => return Ok(true),
-                Ok(false) => {},
-                Err(e) => {
-                    // A recorded-but-changed key is always a hard failure.
-                    let line = match &e {
-                        keys::Error::KeyChanged { line } => line.to_string(),
-                        _ => "?".to_string(),
-                    };
-                    *self.hostkey_reason.lock().expect("hostkey lock") = Some(format!(
-                        "host key of {host}:{port} changed ({} line {line}); remove the stale \
-                         entry or verify the server",
-                        path.display()
-                    ));
-                    return Ok(false);
-                },
-            }
+        match decide_host_key(host, port, self.resolved.strict_host_keys, &files, |path| {
+            KnownHostCheck::from_result(check_known_hosts_path(
+                host,
+                port,
+                &server_public_key,
+                path,
+            ))
+        }) {
+            HostKeyDecision::Accept => Ok(true),
+            HostKeyDecision::Reject(reason) => {
+                *self.hostkey_reason.lock().expect("hostkey lock") = Some(reason);
+                Ok(false)
+            },
         }
-        if files.is_empty() || !self.resolved.strict_host_keys {
-            // Matches `StrictHostKeyChecking no/off/accept-new`: first sight
-            // of a host (or no usable known_hosts at all) is accepted.
-            return Ok(true);
-        }
-        let names = files
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        *self.hostkey_reason.lock().expect("hostkey lock") = Some(format!(
-            "host key of {host}:{port} not found in {names}; connect once with `ssh {host} true` \
-             to record it"
-        ));
-        Ok(false)
     }
+}
+
+/// Outcome of checking one known_hosts file for the server key.
+enum KnownHostCheck {
+    /// The file records this exact key for the host.
+    Matched,
+    /// The file has no entry for the host.
+    Absent,
+    /// The file records a different key for the host, or cannot be parsed;
+    /// both fail closed as a changed key.
+    Changed { line: String },
+}
+
+impl KnownHostCheck {
+    fn from_result(r: std::result::Result<bool, keys::Error>) -> Self {
+        match r {
+            Ok(true) => Self::Matched,
+            Ok(false) => Self::Absent,
+            Err(e) => Self::Changed {
+                line: match &e {
+                    keys::Error::KeyChanged { line } => line.to_string(),
+                    _ => "?".to_string(),
+                },
+            },
+        }
+    }
+}
+
+/// Verdict for a server key: accept, or reject with a user-facing reason.
+enum HostKeyDecision {
+    Accept,
+    Reject(String),
+}
+
+/// Decide whether the server key of `host`:`port` may be trusted.
+///
+/// `files` are the existing known_hosts files in ssh config order; `check` is
+/// invoked lazily per file and evaluation stops at the first match or change,
+/// so an earlier match never sees a later file's failure.
+fn decide_host_key<F>(
+    host: &str,
+    port: u16,
+    strict: bool,
+    files: &[&Path],
+    mut check: F,
+) -> HostKeyDecision
+where
+    F: FnMut(&Path) -> KnownHostCheck,
+{
+    let mut checked: Vec<&Path> = Vec::new();
+    for path in files {
+        match check(path) {
+            KnownHostCheck::Matched => return HostKeyDecision::Accept,
+            KnownHostCheck::Absent => checked.push(path),
+            KnownHostCheck::Changed { line } => {
+                return HostKeyDecision::Reject(format!(
+                    "host key of {host}:{port} changed ({} line {line}); remove the stale entry \
+                     or verify the server",
+                    path.display()
+                ));
+            },
+        }
+    }
+    if !strict {
+        // Matches `StrictHostKeyChecking no/off/accept-new`: first sight of
+        // a host is accepted.
+        return HostKeyDecision::Accept;
+    }
+    if checked.is_empty() {
+        // sp never writes known_hosts, so an empty file set is not first-use
+        // trust but a permanent skip of key verification; refuse instead.
+        return HostKeyDecision::Reject(format!(
+            "no readable known_hosts file to verify the host key of {host}:{port}; sp does not \
+             write known_hosts, run `ssh {host} true` once on this machine so OpenSSH records the \
+             key"
+        ));
+    }
+    let names = checked
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    HostKeyDecision::Reject(format!(
+        "host key of {host}:{port} not found in {names}; connect once with `ssh {host} true` to \
+         record it"
+    ))
 }
 
 /// Handle alias used across the crate.
@@ -262,4 +332,82 @@ async fn connect_agent()
 #[cfg(unix)]
 async fn connect_agent() -> std::result::Result<AgentClient<tokio::net::UnixStream>, keys::Error> {
     AgentClient::connect_env().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_files_strict_rejects_with_guidance() {
+        match decide_host_key("h", 22, true, &[], |_| unreachable!()) {
+            HostKeyDecision::Reject(reason) => {
+                assert!(reason.contains("no readable known_hosts file"));
+                assert!(reason.contains("sp does not write known_hosts"));
+                assert!(reason.contains("`ssh h true`"));
+            },
+            HostKeyDecision::Accept => panic!("strict mode must reject without known_hosts"),
+        }
+    }
+
+    #[test]
+    fn no_files_non_strict_accepts() {
+        assert!(matches!(
+            decide_host_key("h", 22, false, &[], |_| unreachable!()),
+            HostKeyDecision::Accept
+        ));
+    }
+
+    #[test]
+    fn unrecorded_host() {
+        let files = [
+            Path::new("/u/.ssh/known_hosts"),
+            Path::new("/etc/ssh/ssh_known_hosts"),
+        ];
+        match decide_host_key("h", 2222, true, &files, |_| KnownHostCheck::Absent) {
+            HostKeyDecision::Reject(reason) => {
+                assert!(reason.contains("h:2222"));
+                assert!(reason.contains("/u/.ssh/known_hosts, /etc/ssh/ssh_known_hosts"));
+                assert!(reason.contains("`ssh h true`"));
+            },
+            HostKeyDecision::Accept => panic!("strict mode must reject an unrecorded host"),
+        }
+        assert!(matches!(
+            decide_host_key("h", 22, false, &files, |_| KnownHostCheck::Absent),
+            HostKeyDecision::Accept
+        ));
+    }
+
+    #[test]
+    fn matched_accepts_and_stops_checking() {
+        let files = [Path::new("/a"), Path::new("/b")];
+        let mut calls = 0;
+        let decision = decide_host_key("h", 22, true, &files, |_| {
+            calls += 1;
+            KnownHostCheck::Matched
+        });
+        assert!(matches!(decision, HostKeyDecision::Accept));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn changed_key_is_a_hard_failure_even_non_strict() {
+        let files = [Path::new("/a"), Path::new("/b")];
+        let mut calls = 0;
+        let decision = decide_host_key("h", 22, false, &files, |path| {
+            calls += 1;
+            if path == Path::new("/a") {
+                KnownHostCheck::Changed { line: "3".into() }
+            } else {
+                KnownHostCheck::Matched
+            }
+        });
+        match decision {
+            HostKeyDecision::Reject(reason) => {
+                assert!(reason.contains("changed (/a line 3)"));
+            },
+            HostKeyDecision::Accept => panic!("a changed key must fail even in non-strict mode"),
+        }
+        assert_eq!(calls, 1);
+    }
 }
