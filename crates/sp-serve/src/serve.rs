@@ -232,9 +232,18 @@ async fn execute(
         .timeout_ms
         .filter(|ms| *ms > 0)
         .map(Duration::from_millis);
-    let mut term_deadline = timeout.map(|t| Instant::now() + t);
+    // `Instant + Duration` panics on clock overflow, which would abort serve
+    // mid-run without an Exit frame; an unrepresentable timeout degrades to
+    // running without one (logged). The daemon clamps timeouts before they
+    // reach the wire, this is defense in depth.
+    let mut term_deadline = timeout.and_then(|t| Instant::now().checked_add(t));
+    if timeout.is_some() && term_deadline.is_none() {
+        log(&format!(
+            "timeout_ms={} overflows the clock, running without a timeout",
+            req.timeout_ms.unwrap_or_default()
+        ));
+    }
     let mut kill_deadline: Option<Instant> = None;
-    let far = Instant::now() + Duration::from_secs(86_400 * 365);
     let mut dead_rx = std::pin::pin!(dead_rx);
     let mut wait = std::pin::pin!(child.wait());
     let mut timed_out = false;
@@ -244,7 +253,14 @@ async fn execute(
         let sel = tokio::select! {
             c = ctrl_rx.recv(), if ctrl_open => Sel::Ctrl(c),
             s = &mut wait => Sel::Exit(s),
-            () = tokio::time::sleep_until(kill_deadline.or(term_deadline).unwrap_or(far)), if kill_deadline.is_some() || term_deadline.is_some() => Sel::Timeout,
+            // Pending forever when no deadline is armed, so no placeholder
+            // "far" instant is needed.
+            () = async {
+                match kill_deadline.or(term_deadline) {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            }, if kill_deadline.is_some() || term_deadline.is_some() => Sel::Timeout,
             d = &mut dead_rx => Sel::Dead(d.is_ok()),
         };
         match sel {
@@ -280,7 +296,16 @@ async fn execute(
                     ));
                     kill_group(pgid, Signal::Term);
                     term_deadline = None;
-                    kill_deadline = Some(Instant::now() + TERM_GRACE);
+                    if let Some(at) = Instant::now().checked_add(TERM_GRACE) {
+                        kill_deadline = Some(at);
+                    } else {
+                        // The clock cannot represent the grace (it is at its
+                        // very end): escalate to KILL now instead of losing
+                        // the escalation.
+                        log("cannot schedule the KILL grace, escalating now");
+                        kill_group_raw(pgid, libc::SIGKILL);
+                        kill_deadline = None;
+                    }
                 } else {
                     log(&format!("grace elapsed, sending KILL to pgid {pgid}"));
                     kill_group_raw(pgid, libc::SIGKILL);

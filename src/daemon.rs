@@ -41,6 +41,14 @@ const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 /// the host lock.
 const WATCHDOG_GRACE: Duration = Duration::from_secs(15);
 
+/// `Instant::now() + d`, checked. A bare `+` panics on clock overflow and
+/// release builds abort, which one oversized request must never do to the
+/// resident daemon; `None` degrades the caller to "no deadline". The entry
+/// points already clamp timeouts, this is defense in depth.
+fn deadline_after(d: Duration) -> Option<tokio::time::Instant> {
+    tokio::time::Instant::now().checked_add(d)
+}
+
 /// Host-level state: connection and deploy artifact, shared by every session
 /// on the host.
 struct HostConn {
@@ -94,15 +102,16 @@ pub async fn run() -> Result<()> {
         .map(Duration::from_secs);
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let idle_now = Arc::new(tokio::sync::Notify::new());
-    let far = tokio::time::Instant::now() + Duration::from_secs(86_400 * 365);
 
     loop {
+        // None while connections are active, or when an absurd SP_IDLE_SECS
+        // overflows the clock: without a representable deadline the daemon
+        // simply never idles out.
         let deadline = if active.load(Ordering::SeqCst) == 0 {
-            idle.map(|d| tokio::time::Instant::now() + d)
+            idle.and_then(deadline_after)
         } else {
             None
         };
-        let deadline = deadline.unwrap_or(far);
         tokio::select! {
             res = listener.accept() => {
                 let stream = res
@@ -116,11 +125,18 @@ pub async fn run() -> Result<()> {
                     }
                 });
             }
-            () = tokio::time::sleep_until(deadline), if idle.is_some() && deadline != far => {
+            // Pending forever when no deadline is armed, so no placeholder
+            // "far" instant is needed.
+            () = async {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            }, if deadline.is_some() => {
                 info!("idle timeout reached, exiting");
                 return Ok(());
             }
-            () = idle_now.notified(), if deadline == far => {
+            () = idle_now.notified(), if deadline.is_none() => {
                 // Last connection finished; loop again to re-arm the timer.
             }
         }
@@ -376,9 +392,15 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
         let watchdog = eff_req
             .timeout_ms
             .filter(|ms| *ms > 0)
-            .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms) + WATCHDOG_GRACE);
-        let far = tokio::time::Instant::now() + Duration::from_secs(86_400 * 365);
-        let watchdog_at = watchdog.unwrap_or(far);
+            .and_then(|ms| Duration::from_millis(ms).checked_add(WATCHDOG_GRACE))
+            .and_then(deadline_after);
+        if eff_req.timeout_ms.is_some_and(|ms| ms > 0) && watchdog.is_none() {
+            warn!(
+                "host={} timeout_ms={} overflows the clock, running without a watchdog",
+                req.host,
+                eff_req.timeout_ms.unwrap_or_default(),
+            );
+        }
 
         loop {
             tokio::select! {
@@ -423,7 +445,14 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
                         Err(e) => break Err(e.brief()),
                     }
                 }
-                () = tokio::time::sleep_until(watchdog_at), if watchdog.is_some() => {
+                // Pending forever without a watchdog, so the branch needs no
+                // placeholder deadline.
+                () = async {
+                    match watchdog {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     break Err(format!(
                         "watchdog: no exit report within {}ms; the exec channel was closed, see \
                          the daemon log for sp-serve diagnostics",
