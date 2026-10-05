@@ -3,6 +3,8 @@
 
 use std::{
     path::{Path, PathBuf},
+    pin::Pin,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -286,21 +288,100 @@ pub async fn run(
     report
 }
 
-/// Convenience wrapper capturing output in memory (used by MCP and tests).
+/// Per-stream capture cap for the in-memory capture below: keep at most this
+/// many bytes of a stream, drop the rest and count it. A firehose command
+/// (`yes`, `cat /dev/zero`, ...) must not grow the client's memory without
+/// bound inside the timeout window. 512 KiB per stream (1 MiB for stdout and
+/// stderr combined) sits far above the 64 KiB an MCP tool result clips to,
+/// so ordinary output is never touched while the worst case stays small.
+const CAPTURE_CAP: usize = 512 * 1024;
+
+/// Bytes of each output stream discarded by [`run_captured_capped`] after
+/// [`CAPTURE_CAP`] was reached. Pure bookkeeping: the exit report is
+/// unaffected.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DroppedBytes {
+    pub stdout: u64,
+    pub stderr: u64,
+}
+
+/// Convenience wrapper capturing output in memory (used by tests); the
+/// per-stream cap applies, drop counts are discarded.
 pub async fn run_captured(
     req: ExecRequest,
     stdin: Vec<u8>,
     signals: mpsc::Receiver<Signal>,
 ) -> Result<(RunReport, Vec<u8>, Vec<u8>)> {
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
+    run_captured_capped(req, stdin, signals)
+        .await
+        .map(|(report, stdout, stderr, _)| (report, stdout, stderr))
+}
+
+/// Captured run with bounded memory: each stream keeps at most [`CAPTURE_CAP`]
+/// bytes, the overflow is counted in [`DroppedBytes`] so callers can annotate
+/// their output. Exit code and report semantics match [`run`].
+pub async fn run_captured_capped(
+    req: ExecRequest,
+    stdin: Vec<u8>,
+    signals: mpsc::Receiver<Signal>,
+) -> Result<(RunReport, Vec<u8>, Vec<u8>, DroppedBytes)> {
+    let mut stdout = CappedSink::default();
+    let mut stderr = CappedSink::default();
     let io = RunIo {
         stdin: Box::new(std::io::Cursor::new(stdin)),
         stdout: Box::new(&mut stdout),
         stderr: Box::new(&mut stderr),
     };
     let report = run(req, io, signals).await?;
-    Ok((report, stdout, stderr))
+    let dropped = DroppedBytes {
+        stdout: stdout.dropped,
+        stderr: stderr.dropped,
+    };
+    Ok((report, stdout.buf, stderr.buf, dropped))
+}
+
+/// AsyncWrite sink behind the captured run: keeps at most [`CAPTURE_CAP`]
+/// bytes, counts the rest as dropped.
+#[derive(Default)]
+struct CappedSink {
+    buf: Vec<u8>,
+    dropped: u64,
+}
+
+impl AsyncWrite for CappedSink {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        this.dropped += append_capped(&mut this.buf, CAPTURE_CAP, buf) as u64;
+        // Report the whole chunk as consumed: dropped bytes are deliberate,
+        // and a short write would make `write_all` spin retrying.
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Extend `buf` with the prefix of `chunk` that fits below `cap`; returns the
+/// number of dropped bytes. Invariant: `buf.len() <= cap`.
+fn append_capped(buf: &mut Vec<u8>, cap: usize, chunk: &[u8]) -> usize {
+    debug_assert!(buf.len() <= cap);
+    let room = cap - buf.len();
+    if chunk.len() <= room {
+        buf.extend_from_slice(chunk);
+        0
+    } else {
+        buf.extend_from_slice(&chunk[..room]);
+        chunk.len() - room
+    }
 }
 
 /// Read a script file for `-f` execution.
@@ -380,7 +461,19 @@ pub fn download_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_bare_word, shell_quote};
+    use super::{append_capped, is_bare_word, shell_quote};
+
+    #[test]
+    fn append_capped_keeps_prefix_and_counts_the_rest() {
+        let mut buf = Vec::new();
+        assert_eq!(append_capped(&mut buf, 8, b"abc"), 0);
+        assert_eq!(append_capped(&mut buf, 8, b"defg"), 0);
+        assert_eq!(buf, b"abcdefg");
+        // Exceeds the cap by two, then everything is dropped once full.
+        assert_eq!(append_capped(&mut buf, 8, b"hij"), 2);
+        assert_eq!(append_capped(&mut buf, 8, b"more"), 4);
+        assert_eq!(buf, b"abcdefgh");
+    }
 
     #[test]
     fn quotes_only_what_needs_it() {

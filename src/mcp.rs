@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     check_timeout_ms,
-    client::{self, RunReport},
+    client::{self, DroppedBytes, RunReport},
     config,
     proto::ExecRequest,
     session::SessionId,
@@ -28,7 +28,7 @@ struct ExecParams {
     command: String,
     #[serde(default)]
     cwd: Option<String>,
-    /// 0 disables the timeout.
+    /// 0 disables the timeout; values above 24 h are rejected as invalid.
     #[serde(default)]
     timeout_ms: Option<u64>,
     /// Session name: independent cwd/state per session on the same host.
@@ -85,9 +85,9 @@ impl SpMcp {
             timeout_ms: Some(timeout_ms),
             session: Some(session.as_str().to_owned()),
         };
-        let (report, stdout, stderr) = call(req, Vec::new()).await?;
+        let (report, stdout, stderr, dropped) = call(req, Vec::new()).await?;
         Ok(CallToolResult::success(vec![ContentBlock::text(
-            format_report(&report, &stdout, &stderr),
+            format_report(&report, &stdout, &stderr, &dropped),
         )]))
     }
 
@@ -105,12 +105,13 @@ impl SpMcp {
             None,
             Some(DEFAULT_TIMEOUT_MS),
         );
-        let (report, stdout, stderr) = call(req, Vec::new()).await?;
-        match file_result(&report, &stdout, &stderr) {
-            Some(err) => Ok(CallToolResult::error(vec![ContentBlock::text(err)])),
-            None => Ok(CallToolResult::success(vec![ContentBlock::text(clip(
-                &stdout,
-            ))])),
+        let (report, stdout, stderr, dropped) = call(req, Vec::new()).await?;
+        if let Some(err) = file_result(&report, &stdout, &stderr, &dropped) {
+            Ok(CallToolResult::error(vec![ContentBlock::text(err)]))
+        } else {
+            let mut text = clip(&stdout);
+            push_dropped(&mut text, &dropped);
+            Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
         }
     }
 
@@ -130,13 +131,13 @@ impl SpMcp {
         );
         let content = params.0.content;
         let len = content.len();
-        let (report, _, stderr) = call(req, content.into_bytes()).await?;
-        match file_result(&report, b"", &stderr) {
-            Some(err) => Ok(CallToolResult::error(vec![ContentBlock::text(err)])),
-            None => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "wrote {} ({len} bytes)",
-                params.0.path
-            ))])),
+        let (report, _, stderr, dropped) = call(req, content.into_bytes()).await?;
+        if let Some(err) = file_result(&report, b"", &stderr, &dropped) {
+            Ok(CallToolResult::error(vec![ContentBlock::text(err)]))
+        } else {
+            let mut text = format!("wrote {} ({len} bytes)", params.0.path);
+            push_dropped(&mut text, &dropped);
+            Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
         }
     }
 }
@@ -151,28 +152,38 @@ fn resolve_session(cli: Option<&str>) -> Result<SessionId, McpError> {
     config::resolve_session(cli).map_err(|e| McpError::invalid_params(e.brief(), None))
 }
 
-/// Run one request with captured streams; no signal forwarding (MCP has no
-/// console to interrupt from).
-async fn call(req: ExecRequest, stdin: Vec<u8>) -> Result<(RunReport, Vec<u8>, Vec<u8>), McpError> {
+/// Run one request with capped captured streams; no signal forwarding (MCP
+/// has no console to interrupt from).
+async fn call(
+    req: ExecRequest,
+    stdin: Vec<u8>,
+) -> Result<(RunReport, Vec<u8>, Vec<u8>, DroppedBytes), McpError> {
     let (signals_tx, signals_rx) = mpsc::channel(1);
     drop(signals_tx);
-    client::run_captured(req, stdin, signals_rx)
+    client::run_captured_capped(req, stdin, signals_rx)
         .await
         .map_err(|e| McpError::internal_error(e.brief(), None))
 }
 
 /// Failure rendering shared by the file tools: `None` means success.
-fn file_result(report: &RunReport, stdout: &[u8], stderr: &[u8]) -> Option<String> {
+fn file_result(
+    report: &RunReport,
+    stdout: &[u8],
+    stderr: &[u8],
+    dropped: &DroppedBytes,
+) -> Option<String> {
     if let Some(e) = &report.error {
         return Some(format!("error: {e}"));
     }
     (report.code != 0).then(|| {
-        format!(
+        let mut s = format!(
             "exit_code: {}\n--- stdout ---\n{}--- stderr ---\n{}",
             report.code,
             clip(stdout),
             clip(stderr)
-        )
+        );
+        push_dropped(&mut s, dropped);
+        s
     })
 }
 
@@ -211,7 +222,31 @@ fn clip(bytes: &[u8]) -> String {
     s
 }
 
-fn format_report(report: &RunReport, stdout: &[u8], stderr: &[u8]) -> String {
+/// Append capture-drop notices at the very end of a tool text, after every
+/// clipped section, so [`clip`] can never cut them off: the caller must
+/// always learn that output was dropped.
+fn push_dropped(out: &mut String, dropped: &DroppedBytes) {
+    use std::fmt::Write as _;
+    if dropped.stdout == 0 && dropped.stderr == 0 {
+        return;
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if dropped.stdout > 0 {
+        let _ = writeln!(out, "[dropped {} bytes of stdout]", dropped.stdout);
+    }
+    if dropped.stderr > 0 {
+        let _ = writeln!(out, "[dropped {} bytes of stderr]", dropped.stderr);
+    }
+}
+
+fn format_report(
+    report: &RunReport,
+    stdout: &[u8],
+    stderr: &[u8],
+    dropped: &DroppedBytes,
+) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let _ = writeln!(out, "exit_code: {}", report.code);
@@ -231,6 +266,7 @@ fn format_report(report: &RunReport, stdout: &[u8], stderr: &[u8]) -> String {
     if !stderr.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
+    push_dropped(&mut out, dropped);
     out
 }
 
