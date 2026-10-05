@@ -23,7 +23,8 @@ pub struct ResolvedHost {
     pub known_hosts_files: Vec<PathBuf>,
     /// ProxyCommand with %h/%p already expanded; None for direct connections.
     pub proxy_command: Option<String>,
-    /// `connecttimeout` seconds (0/unset = library default); TCP only.
+    /// `connecttimeout` seconds (0/unset = library default); bounds the TCP
+    /// connect and the shared handshake + authentication budget.
     pub connect_timeout: Option<Duration>,
     /// `stricthostkeychecking` value: unknown keys are rejected unless this
     /// is `no`/`off`/`accept-new`.

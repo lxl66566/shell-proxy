@@ -4,6 +4,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use russh::{
@@ -16,6 +17,7 @@ use russh::{
 use tokio::{
     net::TcpStream,
     process::{Child, ChildStdin, ChildStdout, Command},
+    time::Instant,
 };
 
 use crate::{
@@ -24,6 +26,22 @@ use crate::{
 };
 
 type Result<T> = std::result::Result<T, Error>;
+
+/// TCP connect timeout when the config sets no `connecttimeout`.
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Shared handshake + authentication budget when the config sets no
+/// `connecttimeout`.
+const SSH_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ceiling for config-derived timeouts. `Instant + Duration` panics on
+/// overflow, so an absurd `connecttimeout` must be capped before any
+/// deadline arithmetic.
+const CONNECT_TIMEOUT_CAP: Duration = Duration::from_secs(86_400);
+
+fn clamp_timeout(d: Duration) -> Duration {
+    d.min(CONNECT_TIMEOUT_CAP)
+}
 
 /// russh client callback implementation doing strict known_hosts checking.
 pub struct ClientHandler {
@@ -185,9 +203,14 @@ impl SshConnection {
 }
 
 /// Connect and authenticate to `resolved`.
+///
+/// The establishment is bounded: TCP by `connecttimeout` (15s default),
+/// handshake and authentication by one shared deadline (`connecttimeout`,
+/// 30s default). A wedged peer or a hung ProxyCommand child fails with a
+/// stage-named timeout error instead of hanging the caller forever.
 pub async fn connect(resolved: ResolvedHost) -> Result<SshConnection> {
     let config = Arc::new(client::Config {
-        keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 3,
         nodelay: true,
         ..Default::default()
@@ -205,31 +228,71 @@ pub async fn connect(resolved: ResolvedHost) -> Result<SshConnection> {
             None => Error::Connect(e.to_string()),
         };
 
+    let setup_timeout = clamp_timeout(resolved.connect_timeout.unwrap_or(SSH_SETUP_TIMEOUT));
+    let setup_secs = setup_timeout.as_secs();
+    // Set by both transport branches; the setup budget starts once the
+    // transport exists, because the TCP connect carries its own timeout.
+    let setup_deadline: Instant;
+
     let mut proxy_child = None;
     let mut handle = if let Some(pc) = resolved.proxy_command.as_deref() {
         let cmd = expand_proxy_command(pc, &resolved.hostname, resolved.port);
-        let (stream, child) =
+        let (stream, mut child) =
             spawn_proxy(&cmd).map_err(|e| Error::Connect(format!("proxycommand {cmd:?}: {e}")))?;
-        proxy_child = Some(child);
-        client::connect_stream(config, stream, handler)
-            .await
-            .map_err(map_connect_err)?
+        setup_deadline = Instant::now() + setup_timeout;
+        match tokio::time::timeout_at(
+            setup_deadline,
+            client::connect_stream(config, stream, handler),
+        )
+        .await
+        {
+            Ok(Ok(h)) => {
+                // The connection owns the child from here on.
+                proxy_child = Some(child);
+                h
+            },
+            Ok(Err(e)) => return Err(map_connect_err(e)),
+            Err(_) => {
+                // The child's pipes are the transport; kill it now instead
+                // of relying on kill_on_drop along the error return.
+                let _ = child.start_kill();
+                return Err(Error::Connect(format!(
+                    "ssh handshake via proxycommand {cmd:?} timed out after {setup_secs}s"
+                )));
+            },
+        }
     } else {
         let addr = (resolved.hostname.as_str(), resolved.port);
         // ssh config ConnectTimeout when set, otherwise a library default.
-        let timeout = resolved
-            .connect_timeout
-            .unwrap_or(std::time::Duration::from_secs(15));
+        let timeout = clamp_timeout(resolved.connect_timeout.unwrap_or(TCP_CONNECT_TIMEOUT));
         let tcp = tokio::time::timeout(timeout, TcpStream::connect(&addr))
             .await
             .map_err(|_| Error::Connect(format!("connect to {addr:?} timed out")))?
             .map_err(|e| Error::Connect(format!("connect to {addr:?}: {e}")))?;
-        client::connect_stream(config, tcp, handler)
+        setup_deadline = Instant::now() + setup_timeout;
+        tokio::time::timeout_at(setup_deadline, client::connect_stream(config, tcp, handler))
             .await
+            .map_err(|_| {
+                Error::Connect(format!(
+                    "ssh handshake with {addr:?} timed out after {setup_secs}s"
+                ))
+            })?
             .map_err(map_connect_err)?
     };
 
-    authenticate(&mut handle, &resolved).await?;
+    // Handshake and authentication share one deadline, so a slow handshake
+    // leaves less room for auth.
+    match tokio::time::timeout_at(setup_deadline, authenticate(&mut handle, &resolved)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(Error::Auth(format!(
+                "timed out after {setup_secs}s authenticating as {user}@{host}:{port}",
+                user = resolved.user,
+                host = resolved.hostname,
+                port = resolved.port
+            )));
+        },
+    }
 
     Ok(SshConnection {
         handle,
