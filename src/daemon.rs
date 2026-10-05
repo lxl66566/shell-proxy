@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sp_proto::{EventFrame, ExecFrame, ExecRequest, ExitReport, INTERNAL_ERROR_CODE, Pong};
+use sp_proto::{EventFrame, ExecFrame, ExecRequest, ExitReport, INTERNAL_ERROR_CODE, Pong, Signal};
 use spdlog::{Level, LevelFilter, Logger, prelude::*, sink::FileSink};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -23,7 +23,7 @@ use tokio::{
 use crate::{
     config,
     error::{Error, Result},
-    remote::{self, ExecOutcome, InputEvent, OutputEvent},
+    remote::{self, ExecOutcome, OutputEvent, StdinEvent},
     session::{self, SessionId},
     ssh::{self, SshConnection},
     ssh_config,
@@ -35,9 +35,28 @@ const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 /// Extra slack over the request timeout before the daemon stops waiting for an
 /// exit report: covers serve's TERM-to-KILL escalation, its bounded pipe
 /// drains and frame latency, so only a genuinely wedged serve (or transport)
-/// trips the watchdog. Dropping the engine then closes the exec channel, which
-/// makes the remote side kill the process group and frees the host lock.
+/// trips the watchdog. Dropping the engine then aborts its channel tasks
+/// (remote::execute keeps them behind a drop guard) and closes the channel
+/// best-effort, which makes the remote side kill the process group and frees
+/// the host lock.
 const WATCHDOG_GRACE: Duration = Duration::from_secs(15);
+
+/// Overall budget for first contact with a host: the ssh connect (whose
+/// transport, handshake and authentication stages each carry their own finer
+/// timeouts in the ssh layer) plus the sp-serve deploy it triggers (arch
+/// probe, checksum, upload - plain exec channels no ssh-layer timeout
+/// covers). Bounds callers that cannot interrupt themselves (MCP) and CLI
+/// requests without a timeout. Cancelling mid-deploy can leave an orphaned
+/// `.upload-*` temp file; the next deploy's stale cleanup removes it.
+const CONNECT_DEPLOY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `Instant::now() + d`, checked. A bare `+` panics on clock overflow and
+/// release builds abort, which one oversized request must never do to the
+/// resident daemon; `None` degrades the caller to "no deadline". The entry
+/// points already clamp timeouts, this is defense in depth.
+fn deadline_after(d: Duration) -> Option<tokio::time::Instant> {
+    tokio::time::Instant::now().checked_add(d)
+}
 
 /// Host-level state: connection and deploy artifact, shared by every session
 /// on the host.
@@ -92,15 +111,16 @@ pub async fn run() -> Result<()> {
         .map(Duration::from_secs);
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let idle_now = Arc::new(tokio::sync::Notify::new());
-    let far = tokio::time::Instant::now() + Duration::from_secs(86_400 * 365);
 
     loop {
+        // None while connections are active, or when an absurd SP_IDLE_SECS
+        // overflows the clock: without a representable deadline the daemon
+        // simply never idles out.
         let deadline = if active.load(Ordering::SeqCst) == 0 {
-            idle.map(|d| tokio::time::Instant::now() + d)
+            idle.and_then(deadline_after)
         } else {
             None
         };
-        let deadline = deadline.unwrap_or(far);
         tokio::select! {
             res = listener.accept() => {
                 let stream = res
@@ -114,11 +134,18 @@ pub async fn run() -> Result<()> {
                     }
                 });
             }
-            () = tokio::time::sleep_until(deadline), if idle.is_some() && deadline != far => {
+            // Pending forever when no deadline is armed, so no placeholder
+            // "far" instant is needed.
+            () = async {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            }, if deadline.is_some() => {
                 info!("idle timeout reached, exiting");
                 return Ok(());
             }
-            () = idle_now.notified(), if deadline == far => {
+            () = idle_now.notified(), if deadline.is_none() => {
                 // Last connection finished; loop again to re-arm the timer.
             }
         }
@@ -194,12 +221,24 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     Ok(())
 }
 
+/// Control frames extracted by the client-frame reader task. Stdin frames are
+/// routed to the engine's stdin lane by the task itself; these are the ones
+/// that must not queue behind a congested lane.
+enum CtrlEvent {
+    Signal(Signal),
+    Ping,
+    /// Client pipe ended cleanly; the reader task already queued StdinEof.
+    ClientGone,
+    /// Client stream is unusable (read error, protocol violation): fail.
+    Fatal(String),
+}
+
 /// Execute one request: forwards subsequent stdin/signal frames to the engine
 /// until it finishes, then reports the exit frame. Consumes the reader.
-async fn handle_exec<S: AsyncRead + Unpin + Send>(
+async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
     shared: &Arc<Shared>,
     req: ExecRequest,
-    mut reader: S,
+    reader: S,
     out_tx: &mpsc::Sender<EventFrame>,
 ) {
     let started = Instant::now();
@@ -251,7 +290,70 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
         .state
         .clone_from(&sess.state.lock().expect("state lock"));
 
-    let (input_tx, input_rx) = mpsc::channel::<InputEvent>(64);
+    // Engine input lanes, split by kind at the source: stdin data (Eof rides
+    // the same lane, which keeps EOF ordered behind the data) and signals.
+    // Both are bounded; the stdin lane is awaited end to end, so backpressure
+    // travels all the way back to the client pipe instead of ever dropping
+    // data.
+    let (stdin_tx, stdin_rx) = mpsc::channel::<StdinEvent>(64);
+    let (sig_tx, sig_rx) = mpsc::channel::<Signal>(8);
+
+    // Client-frame reader task. Stdin frames are pushed into the engine's
+    // stdin lane with a fully awaited send: when the remote stdin window is
+    // full the lane fills and this task stops reading the client pipe - the
+    // end-to-end backpressure. Signals and pings go to the loop below, so a
+    // signal is never stuck behind queued stdin data on this hop.
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<CtrlEvent>(16);
+    let frame_reader = tokio::spawn(async move {
+        let mut reader = reader;
+        loop {
+            match sp_proto::read_exec_frame(&mut reader).await {
+                Ok(Some(ExecFrame::StdinData(d))) => {
+                    if stdin_tx.send(StdinEvent::Data(d)).await.is_err() {
+                        return; // engine gone
+                    }
+                },
+                Ok(Some(ExecFrame::StdinEof)) => {
+                    if stdin_tx.send(StdinEvent::Eof).await.is_err() {
+                        return;
+                    }
+                },
+                Ok(Some(ExecFrame::Signal(s))) => {
+                    if ctrl_tx.send(CtrlEvent::Signal(s)).await.is_err() {
+                        return;
+                    }
+                },
+                Ok(Some(ExecFrame::Ping)) => {
+                    if ctrl_tx.send(CtrlEvent::Ping).await.is_err() {
+                        return;
+                    }
+                },
+                // One exec per connection; a second request is a protocol
+                // violation.
+                Ok(Some(ExecFrame::Exec(_))) => {
+                    let _ = ctrl_tx
+                        .send(CtrlEvent::Fatal(
+                            "nested exec on one connection is not supported".into(),
+                        ))
+                        .await;
+                    return;
+                },
+                Ok(None) => {
+                    // Client vanished; give the remote side EOF, not a kill,
+                    // and let it finish (cwd still updates). The lane keeps
+                    // the EOF ordered behind all data already queued.
+                    let _ = stdin_tx.send(StdinEvent::Eof).await;
+                    let _ = ctrl_tx.send(CtrlEvent::ClientGone).await;
+                    return;
+                },
+                Err(e) => {
+                    let _ = ctrl_tx.send(CtrlEvent::Fatal(e.to_string())).await;
+                    return;
+                },
+            }
+        }
+    });
+
     let (event_tx, mut event_rx) = mpsc::channel::<OutputEvent>(256);
     let stdout_bytes = Arc::new(AtomicU64::new(0));
     let stderr_bytes = Arc::new(AtomicU64::new(0));
@@ -276,19 +378,22 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
     });
 
     let outcome: std::result::Result<ExecOutcome, String> = {
-        // Scoped so the engine future is dropped before the bridge is joined
-        // below: the bridge ends only once the engine's event sender is gone,
-        // and dropping the engine also closes the exec channel, letting the
-        // remote side clean up when we abandon the execution.
+        // Scoped so the engine future is dropped before the frame reader and
+        // bridge are joined below: the bridge ends only once the engine's
+        // event sender is gone, and dropping the engine aborts its channel
+        // tasks and closes the exec channel best-effort (remote::execute
+        // keeps them behind a drop guard), letting the remote side clean up
+        // when we abandon the execution.
         let mut engine = std::pin::pin!(remote::execute(
             conn.conn.handle(),
             &conn.serve_path,
             &eff_req,
-            input_rx,
+            stdin_rx,
+            sig_rx,
             event_tx,
         ));
 
-        let mut reader_open = true;
+        let mut ctrl_open = true;
         // Watchdog: serve enforces timeout_ms itself (TERM then KILL) and its
         // drains are bounded, so a healthy execution always reports before
         // this fires; unlimited requests opt out. Without it one wedged
@@ -296,48 +401,51 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
         let watchdog = eff_req
             .timeout_ms
             .filter(|ms| *ms > 0)
-            .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms) + WATCHDOG_GRACE);
-        let far = tokio::time::Instant::now() + Duration::from_secs(86_400 * 365);
-        let watchdog_at = watchdog.unwrap_or(far);
+            .and_then(|ms| Duration::from_millis(ms).checked_add(WATCHDOG_GRACE))
+            .and_then(deadline_after);
+        if eff_req.timeout_ms.is_some_and(|ms| ms > 0) && watchdog.is_none() {
+            warn!(
+                "host={} timeout_ms={} overflows the clock, running without a watchdog",
+                req.host,
+                eff_req.timeout_ms.unwrap_or_default(),
+            );
+        }
 
         loop {
             tokio::select! {
-                frame = sp_proto::read_exec_frame(&mut reader), if reader_open => {
-                    match frame {
-                        Ok(Some(ExecFrame::StdinData(d))) => {
-                            if input_tx.send(InputEvent::Stdin(d)).await.is_err() {
-                                break Err("engine died unexpectedly".into());
-                            }
-                        }
-                        Ok(Some(ExecFrame::StdinEof)) => {
-                            let _ = input_tx.send(InputEvent::StdinEof).await;
-                        }
-                        Ok(Some(ExecFrame::Signal(s))) => {
+                ctrl = ctrl_rx.recv(), if ctrl_open => {
+                    match ctrl {
+                        Some(CtrlEvent::Signal(s)) => {
                             info!("forwarding signal {} to engine", s.as_str());
-                            let _ = input_tx.send(InputEvent::Signal(s)).await;
-                        }
-                        Ok(Some(ExecFrame::Ping)) => {
+                            // Small lane, drained promptly by the engine's
+                            // forwarder; beyond it a signal drops with a warn
+                            // (every signal also travels out of band). A
+                            // closed lane means the engine is already
+                            // finishing - nothing left to deliver to.
+                            if let Err(mpsc::error::TrySendError::Full(_)) = sig_tx.try_send(s) {
+                                warn!("signal lane full, dropping {} signal", s.as_str());
+                            }
+                        },
+                        Some(CtrlEvent::Ping) => {
                             let _ = out_tx
                                 .send(EventFrame::Pong(Pong { pid: std::process::id() }))
                                 .await;
-                        }
-                        Ok(Some(ExecFrame::Exec(_))) => {
-                            let _ = input_tx.send(InputEvent::StdinEof).await;
-                            break Err("nested exec on one connection is not supported".into());
-                        }
-                        Ok(None) => {
-                            // Client vanished; give the remote side EOF, not a kill,
-                            // and let it finish (cwd still updates). Polling an EOF
-                            // stream again would busy-loop.
-                            reader_open = false;
+                        },
+                        Some(CtrlEvent::ClientGone) => {
                             warn!(
                                 "host={} client disconnected while the command was running; \
                                  letting it finish",
                                 req.host
                             );
-                            let _ = input_tx.send(InputEvent::StdinEof).await;
-                        }
-                        Err(e) => break Err(e.to_string()),
+                        },
+                        Some(CtrlEvent::Fatal(msg)) => break Err(msg),
+                        None => {
+                            // Frame reader ended without a verdict (the
+                            // engine lanes are closing); polling a closed
+                            // channel would busy-loop, and the engine branch
+                            // settles the outcome.
+                            ctrl_open = false;
+                        },
                     }
                 }
                 res = &mut engine => {
@@ -346,7 +454,14 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
                         Err(e) => break Err(e.brief()),
                     }
                 }
-                () = tokio::time::sleep_until(watchdog_at), if watchdog.is_some() => {
+                // Pending forever without a watchdog, so the branch needs no
+                // placeholder deadline.
+                () = async {
+                    match watchdog {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     break Err(format!(
                         "watchdog: no exit report within {}ms; the exec channel was closed, see \
                          the daemon log for sp-serve diagnostics",
@@ -356,7 +471,12 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
             }
         }
     };
-    drop(input_tx);
+    // The frame reader may be parked reading a silent client pipe; it owns
+    // the stdin lane's send end, so it must not outlive the engine. Aborting a
+    // finished task is a no-op.
+    frame_reader.abort();
+    let _ = frame_reader.await;
+    drop(sig_tx);
     let _ = bridge.await;
 
     // A dead connection cannot be retried transparently (forwarded stdin is
@@ -435,6 +555,9 @@ fn abbreviate(s: &str) -> String {
 /// connect to one host must not block commands to already-connected hosts.
 /// On a connect race the losing connection is dropped; the winner's state
 /// stays in the map.
+///
+/// A fresh connect, including the deploy inside it, runs under
+/// [`CONNECT_DEPLOY_TIMEOUT`] - cached connections skip the bound entirely.
 async fn get_or_connect(shared: &Arc<Shared>, host: &str) -> Result<Arc<HostConn>> {
     let live = |hosts: &HashMap<String, Arc<HostConn>>| {
         hosts.get(host).filter(|c| !c.conn.is_closed()).cloned()
@@ -442,7 +565,18 @@ async fn get_or_connect(shared: &Arc<Shared>, host: &str) -> Result<Arc<HostConn
     if let Some(conn) = live(&*shared.hosts.lock().await) {
         return Ok(conn);
     }
-    let conn = connect_host(host).await?;
+    let attempt = connect_host(host);
+    let conn = match deadline_after(CONNECT_DEPLOY_TIMEOUT) {
+        // Two `?`: the timeout's Elapsed, then the connect error itself.
+        Some(at) => tokio::time::timeout_at(at, attempt).await.map_err(|_| {
+            Error::Connect(format!(
+                "host {host}: connect or deploy did not complete within {}s",
+                CONNECT_DEPLOY_TIMEOUT.as_secs()
+            ))
+        })??,
+        // Clock overflow: unreachable for this constant, degrade to unbounded.
+        None => attempt.await?,
+    };
     let mut hosts = shared.hosts.lock().await;
     if let Some(existing) = live(&hosts) {
         return Ok(existing); // another task connected first; keep the winner

@@ -40,21 +40,28 @@ pub fn rc_body(stderr_fd: i32) -> String {
 ///   after a user `--cwd`) and PWD (owned by the cd mechanism; restoring a stale string would
 ///   desync `$PWD` from the real directory) are kept out of the dump; OLDPWD stays so `cd -` works
 ///   across commands;
-/// - the dump is all builtins, no fork: declare/alias/shopt/set/umask read in-memory tables, and
+/// - the dump is all builtins reading in-memory tables (declare/alias/shopt/set/umask), and
 ///   `declare -p` output is one safely quoted line per variable, so it round-trips through eval as
-///   data, not syntax;
+///   data, not syntax. It runs in a subshell so the unsets keeping wrapper internals and PWD/SP_CWD
+///   out of the dump cannot clear `__sp_rc`, which the final `exit` still has to read;
 /// - errexit is dropped right after the command: a restored `set -e` plus a failing command would
 ///   abort the wrapper before the cwd report and state dump run;
-/// - the traps pin the exit status to 128+signum when a group-wide signal (sent by serve on local
-///   Ctrl+C / timeout) also hits this bash.
+/// - the traps record the signal as a flag instead of exiting: bash runs a trap only after the
+///   current foreground command finishes, so both a signal that killed the foreground child (eval
+///   returns with 128+signum already in `$?`) and one that hit an idle bash still leave the
+///   epilogue - cwd report and state dump - intact. The recorded flag then pins the exit status to
+///   128+signum when the signal also reached this bash (serve sends it to the whole group on local
+///   Ctrl+C / timeout). The only unrecoverable case is a SIGKILL aimed at this bash itself, which
+///   could never report anything anyway.
 pub fn wrapper_body(cmd_fd: i32, restore_fd: i32, dump_fd: i32, pwd_fd: i32) -> String {
     format!(
         "if [ -n \"${{SP_CWD:-}}\" ]; then\n  cd -- \"$SP_CWD\" || {{ printf 'sp: cannot cd to \
-         %s, using HOME\\n' \"$SP_CWD\" >&2; cd; }}\nfi\ntrap 'exit 130' INT\ntrap 'exit 143' \
-         TERM\ntrap 'exit 129' HUP\n{{ eval \"$(cat /dev/fd/{restore_fd})\"; }} 2>/dev/null\neval \
-         \"$(cat /dev/fd/{cmd_fd})\"\n__sp_rc=$?\nset +e\nprintf '%s\\0' \"$PWD\" \
-         >&{pwd_fd}\nexec 2>/dev/null\nunset SP_CWD PWD\n{{ declare -p; declare -f; alias; shopt \
-         -p; set +o; umask -p; printf '\\0'; }} >&{dump_fd}\nexit \"$__sp_rc\"\n"
+         %s, using HOME\\n' \"$SP_CWD\" >&2; cd; }}\nfi\n__sp_sig=\ntrap '__sp_sig=130' INT\ntrap \
+         '__sp_sig=143' TERM\ntrap '__sp_sig=129' HUP\n{{ eval \"$(cat /dev/fd/{restore_fd})\"; \
+         }} 2>/dev/null\neval \"$(cat /dev/fd/{cmd_fd})\"\n__sp_rc=$?\n[ -n \"$__sp_sig\" ] && \
+         __sp_rc=$__sp_sig\nset +e\nprintf '%s\\0' \"$PWD\" >&{pwd_fd}\nexec 2>/dev/null\n( unset \
+         __sp_rc __sp_sig SP_CWD PWD; declare -p; declare -f; alias; shopt -p; set +o; umask -p; \
+         printf '\\0'; ) >&{dump_fd}\nexit \"$__sp_rc\"\n"
     )
 }
 
@@ -74,19 +81,36 @@ mod tests {
         assert!(w.contains("eval \"$(cat /dev/fd/10)\""));
         assert!(w.contains(">&11"));
         assert!(w.contains(">&12"));
-        // traps must pin 128+signum exit codes
-        assert!(w.contains("trap 'exit 130' INT"));
-        assert!(w.contains("trap 'exit 143' TERM"));
-        assert!(w.contains("trap 'exit 129' HUP"));
-        // errexit must be off before the reports run
-        let rc_capture = w.find("__sp_rc=$?").expect("rc captured");
-        let report = w.find("printf '%s\\0' \"$PWD\"").expect("pwd report");
-        assert!(
-            w[rc_capture..report].contains("set +e"),
-            "set +e must sit between rc capture and the reports"
-        );
         // exit status propagation last
         assert!(w.ends_with("exit \"$__sp_rc\"\n"));
+    }
+
+    #[test]
+    fn traps_record_a_flag_instead_of_exiting() {
+        let w = wrapper_body(9, 10, 12, 11);
+        // The flag starts empty (so nothing restored from a dump can fake a
+        // signal) and the traps arm before the command can receive one.
+        assert!(w.contains("__sp_sig=\ntrap '__sp_sig=130' INT"));
+        assert!(w.contains("trap '__sp_sig=143' TERM"));
+        assert!(w.contains("trap '__sp_sig=129' HUP"));
+        assert!(!w.contains("trap 'exit"));
+        let trap = w.find("trap '__sp_sig=130' INT").expect("trap");
+        let cmd = w.find("eval \"$(cat /dev/fd/9)\"").expect("command eval");
+        assert!(trap < cmd);
+    }
+
+    #[test]
+    fn signal_flag_pins_exit_code_without_skipping_epilogue() {
+        let w = wrapper_body(9, 10, 12, 11);
+        let rc = w.find("__sp_rc=$?").expect("rc captured");
+        let sig = w
+            .find("[ -n \"$__sp_sig\" ] && __sp_rc=$__sp_sig")
+            .expect("signal override");
+        let off = w.find("set +e").expect("errexit off");
+        let report = w.find("printf '%s\\0' \"$PWD\"").expect("pwd report");
+        let dump = w.find("declare -p").expect("state dump");
+        let exit = w.rfind("exit \"$__sp_rc\"").expect("exit last");
+        assert!(rc < sig && sig < off && off < report && report < dump && dump < exit);
     }
 
     #[test]
@@ -101,9 +125,15 @@ mod tests {
     #[test]
     fn state_dump_excludes_sp_and_pwd() {
         let w = wrapper_body(9, 10, 12, 11);
-        let unset = w.find("unset SP_CWD PWD").expect("unset present");
-        let dump = w.find("declare -p").expect("dump present");
-        assert!(unset < dump);
+        // The dump runs in a subshell: the unsets hide the wrapper internals
+        // from `declare -p` without clearing `__sp_rc` for the final exit.
+        // PWD must stay the last unset word - bash records it in `_`, whose
+        // dumped value is then identical to a dump taken without the unsets.
+        let unset = w
+            .find("( unset __sp_rc __sp_sig SP_CWD PWD; declare -p;")
+            .expect("unset inside the dump subshell");
+        let dump_end = w.rfind(">&12").expect("dump redirect");
+        assert!(unset < dump_end);
         // OLDPWD is not excluded: cd - across commands depends on it
         assert!(!w.contains("OLDPWD"));
     }
@@ -114,6 +144,6 @@ mod tests {
         // must rely on the terminator, not EOF, to know a report is complete.
         let w = wrapper_body(9, 10, 12, 11);
         assert!(w.contains("printf '%s\\0' \"$PWD\" >&11"));
-        assert!(w.contains("umask -p; printf '\\0'; } >&12"));
+        assert!(w.contains("umask -p; printf '\\0'; ) >&12"));
     }
 }

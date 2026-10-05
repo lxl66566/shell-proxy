@@ -151,14 +151,26 @@ pub fn resolve_session(cli: Option<&str>) -> Result<SessionId> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::*;
     use crate::session::DEFAULT_NAME;
 
+    /// Tests in one binary run on parallel threads and the env is process
+    /// global; every test that mutates env vars must hold this lock.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     #[test]
     fn app_dir_prefers_absolute_xdg() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         let old = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: no other test in this binary touches XDG_CONFIG_HOME
+        // SAFETY: serialized against every other env-mutating test
         unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
         assert_eq!(app_dir(), tmp.path().join("shell-proxy"));
         // relative value is ignored per XDG spec
@@ -172,7 +184,10 @@ mod tests {
 
     #[test]
     fn resolve_session_precedence() {
-        // SAFETY: no other test in this binary touches SP_SESSION
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialized against every other env-mutating test
         unsafe { std::env::set_var(ENV_SESSION, "from-env") };
         // CLI arg wins over env
         assert_eq!(
@@ -188,8 +203,11 @@ mod tests {
 
     #[test]
     fn resolve_session_rejects_invalid_input() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(resolve_session(Some("no spaces")).is_err());
-        // SAFETY: no other test in this binary touches SP_SESSION
+        // SAFETY: serialized against every other env-mutating test
         unsafe { std::env::set_var(ENV_SESSION, "no/slashes") };
         assert!(resolve_session(None).is_err());
         unsafe { std::env::remove_var(ENV_SESSION) };

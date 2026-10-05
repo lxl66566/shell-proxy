@@ -4,6 +4,7 @@ use std::{io::IsTerminal, path::PathBuf, process::ExitCode};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use shell_proxy::{
+    check_timeout_ms,
     client::{self, RunIo, is_bare_word},
     config, console,
     proto::{self, ExecRequest, Signal},
@@ -42,7 +43,7 @@ struct Cli {
     cwd: Option<String>,
 
     /// Kill the command after SECONDS seconds (0 = unlimited)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_parser = parse_timeout_secs)]
     timeout: Option<u64>,
 
     /// Execute the given script file instead of the command line
@@ -157,6 +158,14 @@ fn parse_session(s: &str) -> Result<String, String> {
     SessionId::parse(s)
         .map(|_| s.to_owned())
         .map_err(|e| e.to_string())
+}
+
+/// clap value parser: reject oversized timeouts at argument-parsing time, so
+/// they never reach the daemon's deadline arithmetic.
+fn parse_timeout_secs(s: &str) -> Result<u64, String> {
+    let secs = s.parse::<u64>().map_err(|e| e.to_string())?;
+    check_timeout_ms(secs.saturating_mul(1000))?;
+    Ok(secs)
 }
 
 async fn run_command(cli: Cli) -> ExitCode {

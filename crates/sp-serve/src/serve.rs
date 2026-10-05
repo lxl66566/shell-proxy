@@ -2,7 +2,10 @@
 //!
 //! serve is stateless and handles exactly one execution, then exits 0. Its own
 //! stderr (diagnostics) travels as SSH extended data and lands in the daemon
-//! log; only frames go to stdout.
+//! log; only frames go to stdout. Signals arrive two ways: in-band `Signal`
+//! frames on stdin (compatibility path, delivery not guaranteed once stdin
+//! backpressure stalls) and out of band as SSH channel requests that sshd
+//! delivers to the process itself (see [`Signals`]).
 
 use std::time::Duration;
 
@@ -54,6 +57,13 @@ pub async fn run() -> i32 {
 }
 
 async fn inner() -> Result<()> {
+    // Intercept INT/TERM/HUP before anything runs. sshd delivers the daemon's
+    // out-of-band signal requests (SSH channel requests) straight to this
+    // process; under the default dispositions they would kill serve on the
+    // spot and every report would be lost. Failure is fatal, not a silent
+    // degradation: a serve that cannot be signaled cannot be interrupted or
+    // timed out safely.
+    let signals = Signals::install().context("install signal handlers")?;
     let mut stdin = tokio::io::stdin();
     let req = match tokio::time::timeout(EXEC_WAIT, sp_proto::read_exec_frame(&mut stdin)).await {
         Ok(Ok(Some(ExecFrame::Exec(req)))) => req,
@@ -85,11 +95,16 @@ async fn inner() -> Result<()> {
         },
     };
 
-    execute(&req, spawned, stdin).await
+    execute(&req, spawned, stdin, signals).await
 }
 
 /// Run the protocol loop until the child exits, then send the Exit frame.
-async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -> Result<()> {
+async fn execute(
+    req: &ExecRequest,
+    spawned: Spawned,
+    stdin: tokio::io::Stdin,
+    signals: Signals,
+) -> Result<()> {
     let Spawned {
         mut child,
         stdin: child_stdin,
@@ -125,8 +140,10 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
     let cwd_collect = tokio::spawn(read_pipe(cwd, CWD_CAP, "cwd report"));
     let state_collect = tokio::spawn(read_pipe(state, STATE_CAP, "state dump"));
 
-    // Child stdin writer: a closed channel (Eof, or a broken child pipe) drops
-    // the write end, which is what sends EOF to the child.
+    // Child stdin pump: the only writer of the child's stdin pipe, always
+    // awaiting its writes (backpressure without drops or busy-waiting). The
+    // channel closing (Eof, or a broken child pipe) drops the write end,
+    // which is what sends EOF to the child.
     let (stdin_tx, mut stdin_rx) = mpsc::channel::<StdinMsg>(256);
     tokio::spawn(async move {
         let mut w = child_stdin;
@@ -143,12 +160,18 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
     });
 
     // Transport reader. Stdin data is forwarded with a bounded await: when the
-    // child stops reading, the SSH window closes and the producer on the
-    // client side blocks - backpressure end to end instead of dropped data.
-    // Control frames are routed to the main loop so signal handling never
-    // waits behind this task's own awaits.
+    // child stops reading, this send blocks, the SSH stdin window closes and
+    // the producer on the client side blocks - backpressure end to end
+    // instead of dropped data or unbounded buffering. A stalled stdin stream
+    // therefore delays every in-band frame, Signal included, so signals
+    // travel out of band instead: the daemon sends them as SSH channel
+    // requests, sshd delivers them straight to this process whatever the
+    // stdin window state, and the handlers installed at startup feed them
+    // into the control path below. In-band Signal frames remain supported as
+    // a compatibility path, but their delivery is not guaranteed.
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Ctrl>(16);
     let ping_tx = out_tx.clone();
+    let sig_tx = ctrl_tx.clone();
     let route = tokio::spawn(async move {
         let mut stdin = stdin;
         let ctrl_tx = ctrl_tx;
@@ -158,7 +181,7 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
             match sp_proto::read_exec_frame(&mut stdin).await {
                 Ok(Some(ExecFrame::StdinData(d))) => {
                     if stdin_tx.send(StdinMsg::Data(d)).await.is_err() {
-                        break; // child stdin writer gone (child exited)
+                        break; // stdin pump gone (child exited)
                     }
                 },
                 Ok(Some(ExecFrame::StdinEof)) => {
@@ -192,13 +215,35 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
         }
     });
 
+    // Caught signals go through the same control path as in-band Signal
+    // frames: kill_group is idempotent, so a signal that arrives through both
+    // routes only fires once effectively.
+    tokio::spawn(async move {
+        let mut signals = signals;
+        loop {
+            let s = signals.recv().await;
+            if sig_tx.send(Ctrl::Signal(s)).await.is_err() {
+                break; // main loop gone
+            }
+        }
+    });
+
     let timeout = req
         .timeout_ms
         .filter(|ms| *ms > 0)
         .map(Duration::from_millis);
-    let mut term_deadline = timeout.map(|t| Instant::now() + t);
+    // `Instant + Duration` panics on clock overflow, which would abort serve
+    // mid-run without an Exit frame; an unrepresentable timeout degrades to
+    // running without one (logged). The daemon clamps timeouts before they
+    // reach the wire, this is defense in depth.
+    let mut term_deadline = timeout.and_then(|t| Instant::now().checked_add(t));
+    if timeout.is_some() && term_deadline.is_none() {
+        log(&format!(
+            "timeout_ms={} overflows the clock, running without a timeout",
+            req.timeout_ms.unwrap_or_default()
+        ));
+    }
     let mut kill_deadline: Option<Instant> = None;
-    let far = Instant::now() + Duration::from_secs(86_400 * 365);
     let mut dead_rx = std::pin::pin!(dead_rx);
     let mut wait = std::pin::pin!(child.wait());
     let mut timed_out = false;
@@ -208,7 +253,14 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
         let sel = tokio::select! {
             c = ctrl_rx.recv(), if ctrl_open => Sel::Ctrl(c),
             s = &mut wait => Sel::Exit(s),
-            () = tokio::time::sleep_until(kill_deadline.or(term_deadline).unwrap_or(far)), if kill_deadline.is_some() || term_deadline.is_some() => Sel::Timeout,
+            // Pending forever when no deadline is armed, so no placeholder
+            // "far" instant is needed.
+            () = async {
+                match kill_deadline.or(term_deadline) {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            }, if kill_deadline.is_some() || term_deadline.is_some() => Sel::Timeout,
             d = &mut dead_rx => Sel::Dead(d.is_ok()),
         };
         match sel {
@@ -228,7 +280,9 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
                 bail!("bad frame: {e}");
             },
             // Router done (its terminal message was delivered above, or the
-            // child stdin writer is gone); the child exit decides the rest.
+            // stdin pump is gone). The signal task holds its ctrl sender until
+            // execute returns, so None cannot actually fire while the loop
+            // runs; the child exit decides the rest either way.
             Sel::Ctrl(None) => ctrl_open = false,
             Sel::Exit(s) => break s.context("wait on child")?,
             Sel::Timeout => {
@@ -242,7 +296,16 @@ async fn execute(req: &ExecRequest, spawned: Spawned, stdin: tokio::io::Stdin) -
                     ));
                     kill_group(pgid, Signal::Term);
                     term_deadline = None;
-                    kill_deadline = Some(Instant::now() + TERM_GRACE);
+                    if let Some(at) = Instant::now().checked_add(TERM_GRACE) {
+                        kill_deadline = Some(at);
+                    } else {
+                        // The clock cannot represent the grace (it is at its
+                        // very end): escalate to KILL now instead of losing
+                        // the escalation.
+                        log("cannot schedule the KILL grace, escalating now");
+                        kill_group_raw(pgid, libc::SIGKILL);
+                        kill_deadline = None;
+                    }
                 } else {
                     log(&format!("grace elapsed, sending KILL to pgid {pgid}"));
                     kill_group_raw(pgid, libc::SIGKILL);
@@ -323,7 +386,7 @@ enum Sel {
     Dead(bool),
 }
 
-/// Control event routed from the transport reader task to the main loop.
+/// Control event routed to the main loop: transport reader or caught signal.
 enum Ctrl {
     Signal(Signal),
     /// Transport EOF while the command is running.
@@ -335,6 +398,42 @@ enum Ctrl {
 enum StdinMsg {
     Data(Vec<u8>),
     Eof,
+}
+
+/// Caught INT/TERM/HUP, installed before any command runs.
+///
+/// The daemon sends interrupts out of band as SSH channel requests: sshd
+/// delivers them straight to this process, independent of the stdin window
+/// that end-to-end backpressure may have closed. Under the default
+/// dispositions serve itself would die and drop every report; forwarding the
+/// signal to the child's group instead keeps the bash-side trap -> epilogue ->
+/// report chain intact. SIGKILL is not catchable and remains the daemon-side
+/// last resort.
+struct Signals {
+    int: tokio::signal::unix::Signal,
+    term: tokio::signal::unix::Signal,
+    hup: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn install() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            int: signal(SignalKind::interrupt())?,
+            term: signal(SignalKind::terminate())?,
+            hup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    /// Wait for the next signal. Tokio coalesces repeats while nobody awaits,
+    /// which is fine: kill_group is idempotent.
+    async fn recv(&mut self) -> Signal {
+        tokio::select! {
+            _ = self.int.recv() => Signal::Int,
+            _ = self.term.recv() => Signal::Term,
+            _ = self.hup.recv() => Signal::Hup,
+        }
+    }
 }
 
 /// Read an out-of-band report pipe to its NUL terminator.
