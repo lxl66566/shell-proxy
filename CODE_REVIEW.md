@@ -6,6 +6,27 @@
 - 审查方法：3 个并行 subagent 分别负责「客户端 CLI/MCP」「传输协议与 SSH 链路」「远端 serve 与测试」三块做静态审查，主 agent 对全部 P0/P1 级结论逐条复核源码后汇总。审查范围为主 crate `src/`（13 文件）、`crates/sp-proto`、`crates/sp-serve`、`build.rs`、`tests/integration.rs`，共约 5300 行。
 - 审查约束声明：全程纯静态阅读，未运行 `sp` 二进制、未连接远端机器、未运行任何测试，未读取或修改任何运行中的 sp 进程、daemon 日志与用户配置。
 
+## P0/P1 修复进度（2026-10-06 07:50 UTC+8 更新）
+
+- 修复执行：GLM-5.3（manager 审查、指导、合并、提交）+ 最多 3 个并发 subagent 分 4 波实现（按文件集互不相交分波，保证提交原子性）。
+- 验证方式：每波合并态 `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --lib`、`cargo test -p sp-serve --bins` 全绿；sp-serve 的 `cfg(unix)` 代码另做了 linux 目标的交叉 clippy。受「远端 ls 正在跑 benchmark」约束，全程未运行 sp、未连接远端、未跑 `tests/integration.rs`——运行时行为待环境允许后验证（见文末遗留清单）。
+- 本机正在运行的 sp daemon / 配置未被触碰（所有改动只进入源码与 git，不触发任何进程或配置变更）。
+
+| 编号 | 状态 | 提交 | 修复要点 |
+|---|---|---|---|
+| P0-1 | 已修复 | `7e8d754` `e631607` `f64c026` | daemon 侧：forwarder 所有写可被 latched shutdown（watch）取消，`forwarder.await` 有界（join 10s / close 2s / reap 5s），`EngineTasks` drop guard 保证 watchdog drop engine 后任务不泄漏且尽力发出 CHANNEL_CLOSE；信号双路发送——带外 SSH channel request（独立 signal-sender 任务，`Arc<ChannelWriteHalf>` 共享，绕开打满的 stdin window，与 forwarder 的数据写 park 解耦）+ 带内帧兼容路径；Kill 仅带内（SIGKILL 不可捕获，带外会击杀 serve 本体丢失 Exit 报告）。serve 侧：route→pump 恢复有界通道（256）+ await，端到端背压回归；安装 INT/TERM/HUP 处理器接收 sshd 带外投递并 kill_group。四条后果（锁永久持有 / watchdog 泄漏 / Exit 后挂起 / 信号饿死）全部消除 |
+| P1-1 | 已修复 | `da198fb` `0f9fdd9` | 入口钳制：`MAX_TIMEOUT_MS`（24h）+ `check_timeout_ms` 共享校验，CLI clap value_parser 拒绝、MCP 返回 invalid_params；后端纵深：daemon watchdog / serve 超时 / idle 定时器 / TERM→KILL grace 全部 checked 算术，溢出降级「无超时」+ 日志，`far` 占位值改 `pending()` 模式 |
+| P1-2 | 已修复 | `5003f12` `d635b8e` | ssh 层：TCP（connecttimeout，默认 15s）+ 握手/认证共享 deadline（默认 30s，cap 24h）+ ProxyCommand 有界（超时杀子进程）；daemon 层：`get_or_connect`（含首次 deploy）整体 60s；remote 层：execute 前置三步（channel open / exec request / Exec 帧）各 30s。全部阶段命名错误信息。MCP 不再可能无限悬挂 |
+| P1-3 | 已修复 | `4984b88` | trap 改记录 `__sp_sig` 标志（安装前初始化，防旧状态伪造）；eval 后以标志覆盖退出码；epilogue（pwd 报告 + 状态 dump）在任何信号中断下照常执行；dump 子 shell 内 unset `__sp_rc`/`__sp_sig`（PWD 保持最后 unset，`_` 变量 dump 与旧版逐字节一致） |
+| P1-4 | 已修复 | `e631607` | 由构造消除：daemon `frame_reader` → stdin lane（64 帧）→ forwarder 全程 await，任何一跳无 try_send 丢弃；lane 满时停读客户端管道，背压传回本地，文件上传不再静默损坏 |
+| P1-5 | 已修复 | `2f4c76c` | strict 且无任何可读 known_hosts 时拒绝连接并引导先 `ssh <host> true`（sp 不写 known_hosts，非 TOFU）；决策重构为纯函数 `decide_host_key`（枚举决策）+ 5 个单测；已记录但变更的 key 仍硬失败 |
+| P1-6 | 已修复 | `9e67d40` | accept 瞬态失败（connect/create、unix accept）warn + 250ms 退避 + 管道实例重建后继续，仅 bind 级致命错误上抛；含命名管道实例轮换测试。「先建下一个实例再 connect」的空窗消除方案经评估为投机复杂化（多实例并存可致客户端挂死），未采用（注释说明） |
+| P1-7 | 已修复 | `5d3873c` | `CappedSink`（AsyncWrite）每流 512KiB、两流合计 1MiB，超出丢弃并计数；`[dropped N bytes]` 标注以元数据渲染到工具文本最末尾，不被 64KB clip 截掉；exit code 与报告语义不变 |
+
+- 附带修复（非本清单项）：`4239085` 串行化 config 测试的环境变量变更（`SP_SESSION` 竞态在本轮验证中两次实际触发，属 CI 隐患）。
+- 关联影响说明：daemon 与内嵌 sp-serve 的信号带外路径为成对特性；若通过 `SP_SERVE_*` 环境变量覆盖部署旧版 serve 二进制，信号退回仅带内路径（window 打满时送达延迟，功能降级不损坏）——与 P2-5（无版本握手）同源，待 P2-5 一并解决。
+- 遗留验证（环境允许后执行）：`cargo test`（集成）覆盖——stdin 打满 + 超时不悬挂（P0-1 回归）、Ctrl+C / 超时后 cwd 与 state 保持（P1-3）、巨大 `--timeout` 拒绝（P1-1）、空 known_hosts 拒绝（P1-5）、TERM/HUP/KILL 转发。另：musl 目标存在 3 条存量 clippy lint（`child.rs` similar_names、`serve.rs` single_match_else / trivially_copy_pass_by_ref，均为审查基线已有、未触碰行）。
+
 ## 总体架构与数据流
 
 sp 分两级转发：本地 CLI / MCP 客户端通过命名管道（Windows）或 unix socket 用 sp-proto 帧协议（`[1B kind][u32 LE len][payload]`）与本机常驻 daemon 通信；daemon 按 host 维护一条 russh SSH 长连接，首次连接时部署构建期内嵌的 sp-serve 二进制（文件名带版本 + sha256 校验、原子 mv、stale 清理）；每条命令在独立 SSH exec channel 上启动一个 sp-serve 进程，serve 用 `setsid` + `bash -i --rcfile` 拉起交互式 bash（命令文本、rcfile、状态恢复全部经 memfd fd 传递，无字符串拼接进 shell 语法），stdout/stderr 以流式帧回传、Exit 帧（退出码 + 新 cwd + shell 状态 dump）收尾。daemon 按 (host, session) 分桶持久化 cwd/state，session 内用锁串行、session 间并行。超时由 serve 端 TERM、5s 后 KILL 双级强制，daemon 端 watchdog（timeout + 15s）兜底（仅在设置了 timeout 时启用）。信号从 Windows 控制台处理器 / signal_hook 转成协议帧逐跳转发。
@@ -20,6 +41,8 @@ sp 分两级转发：本地 CLI / MCP 客户端通过命名管道（Windows）�
 | P1 | 7 | 特定但现实的输入或场景触发：daemon 崩溃、永久悬挂、静默数据损坏、安全缺口 |
 | P2 | 13 | 边角场景的正确性问题、健壮性缺口、能力缺口 |
 | P3 | 25 | 优化建议、可观测性、文档一致性 |
+
+注：P0 与 P1 全部 8 项已于 2026-10-06 修复并入（见上方「P0/P1 修复进度」）；上表为审查时点快照，P2/P3 保持未动。
 
 ---
 
