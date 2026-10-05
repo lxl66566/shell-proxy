@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sp_proto::{EventFrame, ExecFrame, ExecRequest, ExitReport, INTERNAL_ERROR_CODE, Pong};
+use sp_proto::{EventFrame, ExecFrame, ExecRequest, ExitReport, INTERNAL_ERROR_CODE, Pong, Signal};
 use spdlog::{Level, LevelFilter, Logger, prelude::*, sink::FileSink};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -23,7 +23,7 @@ use tokio::{
 use crate::{
     config,
     error::{Error, Result},
-    remote::{self, ExecOutcome, InputEvent, OutputEvent},
+    remote::{self, ExecOutcome, OutputEvent, StdinEvent},
     session::{self, SessionId},
     ssh::{self, SshConnection},
     ssh_config,
@@ -35,8 +35,10 @@ const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 /// Extra slack over the request timeout before the daemon stops waiting for an
 /// exit report: covers serve's TERM-to-KILL escalation, its bounded pipe
 /// drains and frame latency, so only a genuinely wedged serve (or transport)
-/// trips the watchdog. Dropping the engine then closes the exec channel, which
-/// makes the remote side kill the process group and frees the host lock.
+/// trips the watchdog. Dropping the engine then aborts its channel tasks
+/// (remote::execute keeps them behind a drop guard) and closes the channel
+/// best-effort, which makes the remote side kill the process group and frees
+/// the host lock.
 const WATCHDOG_GRACE: Duration = Duration::from_secs(15);
 
 /// Host-level state: connection and deploy artifact, shared by every session
@@ -194,12 +196,24 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     Ok(())
 }
 
+/// Control frames extracted by the client-frame reader task. Stdin frames are
+/// routed to the engine's stdin lane by the task itself; these are the ones
+/// that must not queue behind a congested lane.
+enum CtrlEvent {
+    Signal(Signal),
+    Ping,
+    /// Client pipe ended cleanly; the reader task already queued StdinEof.
+    ClientGone,
+    /// Client stream is unusable (read error, protocol violation): fail.
+    Fatal(String),
+}
+
 /// Execute one request: forwards subsequent stdin/signal frames to the engine
 /// until it finishes, then reports the exit frame. Consumes the reader.
-async fn handle_exec<S: AsyncRead + Unpin + Send>(
+async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
     shared: &Arc<Shared>,
     req: ExecRequest,
-    mut reader: S,
+    reader: S,
     out_tx: &mpsc::Sender<EventFrame>,
 ) {
     let started = Instant::now();
@@ -251,7 +265,70 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
         .state
         .clone_from(&sess.state.lock().expect("state lock"));
 
-    let (input_tx, input_rx) = mpsc::channel::<InputEvent>(64);
+    // Engine input lanes, split by kind at the source: stdin data (Eof rides
+    // the same lane, which keeps EOF ordered behind the data) and signals.
+    // Both are bounded; the stdin lane is awaited end to end, so backpressure
+    // travels all the way back to the client pipe instead of ever dropping
+    // data.
+    let (stdin_tx, stdin_rx) = mpsc::channel::<StdinEvent>(64);
+    let (sig_tx, sig_rx) = mpsc::channel::<Signal>(8);
+
+    // Client-frame reader task. Stdin frames are pushed into the engine's
+    // stdin lane with a fully awaited send: when the remote stdin window is
+    // full the lane fills and this task stops reading the client pipe - the
+    // end-to-end backpressure. Signals and pings go to the loop below, so a
+    // signal is never stuck behind queued stdin data on this hop.
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<CtrlEvent>(16);
+    let frame_reader = tokio::spawn(async move {
+        let mut reader = reader;
+        loop {
+            match sp_proto::read_exec_frame(&mut reader).await {
+                Ok(Some(ExecFrame::StdinData(d))) => {
+                    if stdin_tx.send(StdinEvent::Data(d)).await.is_err() {
+                        return; // engine gone
+                    }
+                },
+                Ok(Some(ExecFrame::StdinEof)) => {
+                    if stdin_tx.send(StdinEvent::Eof).await.is_err() {
+                        return;
+                    }
+                },
+                Ok(Some(ExecFrame::Signal(s))) => {
+                    if ctrl_tx.send(CtrlEvent::Signal(s)).await.is_err() {
+                        return;
+                    }
+                },
+                Ok(Some(ExecFrame::Ping)) => {
+                    if ctrl_tx.send(CtrlEvent::Ping).await.is_err() {
+                        return;
+                    }
+                },
+                // One exec per connection; a second request is a protocol
+                // violation.
+                Ok(Some(ExecFrame::Exec(_))) => {
+                    let _ = ctrl_tx
+                        .send(CtrlEvent::Fatal(
+                            "nested exec on one connection is not supported".into(),
+                        ))
+                        .await;
+                    return;
+                },
+                Ok(None) => {
+                    // Client vanished; give the remote side EOF, not a kill,
+                    // and let it finish (cwd still updates). The lane keeps
+                    // the EOF ordered behind all data already queued.
+                    let _ = stdin_tx.send(StdinEvent::Eof).await;
+                    let _ = ctrl_tx.send(CtrlEvent::ClientGone).await;
+                    return;
+                },
+                Err(e) => {
+                    let _ = ctrl_tx.send(CtrlEvent::Fatal(e.to_string())).await;
+                    return;
+                },
+            }
+        }
+    });
+
     let (event_tx, mut event_rx) = mpsc::channel::<OutputEvent>(256);
     let stdout_bytes = Arc::new(AtomicU64::new(0));
     let stderr_bytes = Arc::new(AtomicU64::new(0));
@@ -276,19 +353,22 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
     });
 
     let outcome: std::result::Result<ExecOutcome, String> = {
-        // Scoped so the engine future is dropped before the bridge is joined
-        // below: the bridge ends only once the engine's event sender is gone,
-        // and dropping the engine also closes the exec channel, letting the
-        // remote side clean up when we abandon the execution.
+        // Scoped so the engine future is dropped before the frame reader and
+        // bridge are joined below: the bridge ends only once the engine's
+        // event sender is gone, and dropping the engine aborts its channel
+        // tasks and closes the exec channel best-effort (remote::execute
+        // keeps them behind a drop guard), letting the remote side clean up
+        // when we abandon the execution.
         let mut engine = std::pin::pin!(remote::execute(
             conn.conn.handle(),
             &conn.serve_path,
             &eff_req,
-            input_rx,
+            stdin_rx,
+            sig_rx,
             event_tx,
         ));
 
-        let mut reader_open = true;
+        let mut ctrl_open = true;
         // Watchdog: serve enforces timeout_ms itself (TERM then KILL) and its
         // drains are bounded, so a healthy execution always reports before
         // this fires; unlimited requests opt out. Without it one wedged
@@ -302,42 +382,39 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
 
         loop {
             tokio::select! {
-                frame = sp_proto::read_exec_frame(&mut reader), if reader_open => {
-                    match frame {
-                        Ok(Some(ExecFrame::StdinData(d))) => {
-                            if input_tx.send(InputEvent::Stdin(d)).await.is_err() {
-                                break Err("engine died unexpectedly".into());
-                            }
-                        }
-                        Ok(Some(ExecFrame::StdinEof)) => {
-                            let _ = input_tx.send(InputEvent::StdinEof).await;
-                        }
-                        Ok(Some(ExecFrame::Signal(s))) => {
+                ctrl = ctrl_rx.recv(), if ctrl_open => {
+                    match ctrl {
+                        Some(CtrlEvent::Signal(s)) => {
                             info!("forwarding signal {} to engine", s.as_str());
-                            let _ = input_tx.send(InputEvent::Signal(s)).await;
-                        }
-                        Ok(Some(ExecFrame::Ping)) => {
+                            // Small lane, drained promptly by the engine's
+                            // forwarder; beyond it a signal drops with a warn
+                            // (every signal also travels out of band). A
+                            // closed lane means the engine is already
+                            // finishing - nothing left to deliver to.
+                            if let Err(mpsc::error::TrySendError::Full(_)) = sig_tx.try_send(s) {
+                                warn!("signal lane full, dropping {} signal", s.as_str());
+                            }
+                        },
+                        Some(CtrlEvent::Ping) => {
                             let _ = out_tx
                                 .send(EventFrame::Pong(Pong { pid: std::process::id() }))
                                 .await;
-                        }
-                        Ok(Some(ExecFrame::Exec(_))) => {
-                            let _ = input_tx.send(InputEvent::StdinEof).await;
-                            break Err("nested exec on one connection is not supported".into());
-                        }
-                        Ok(None) => {
-                            // Client vanished; give the remote side EOF, not a kill,
-                            // and let it finish (cwd still updates). Polling an EOF
-                            // stream again would busy-loop.
-                            reader_open = false;
+                        },
+                        Some(CtrlEvent::ClientGone) => {
                             warn!(
                                 "host={} client disconnected while the command was running; \
                                  letting it finish",
                                 req.host
                             );
-                            let _ = input_tx.send(InputEvent::StdinEof).await;
-                        }
-                        Err(e) => break Err(e.to_string()),
+                        },
+                        Some(CtrlEvent::Fatal(msg)) => break Err(msg),
+                        None => {
+                            // Frame reader ended without a verdict (the
+                            // engine lanes are closing); polling a closed
+                            // channel would busy-loop, and the engine branch
+                            // settles the outcome.
+                            ctrl_open = false;
+                        },
                     }
                 }
                 res = &mut engine => {
@@ -356,7 +433,12 @@ async fn handle_exec<S: AsyncRead + Unpin + Send>(
             }
         }
     };
-    drop(input_tx);
+    // The frame reader may be parked reading a silent client pipe; it owns
+    // the stdin lane's send end, so it must not outlive the engine. Aborting a
+    // finished task is a no-op.
+    frame_reader.abort();
+    let _ = frame_reader.await;
+    drop(sig_tx);
     let _ = bridge.await;
 
     // A dead connection cannot be retried transparently (forwarded stdin is

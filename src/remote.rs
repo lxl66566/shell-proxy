@@ -6,11 +6,17 @@
 //! arch) and verified by sha256 before use. serve's own stderr arrives as SSH
 //! extended data and is mirrored into the daemon log.
 
+use std::{sync::Arc, time::Duration};
+
 use russh::ChannelMsg;
 use sha2::{Digest, Sha256};
 use sp_proto::{EventDecoder, EventFrame, ExecFrame, ExecRequest, ExitReport, Signal};
 use spdlog::prelude::*;
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+    time::timeout,
+};
 
 use crate::{
     embed::{self, Arch},
@@ -21,12 +27,27 @@ use crate::{
 /// Directory (relative to the remote home) holding deployed binaries.
 const SERVE_DIR: &str = "~/.local/share/shell-proxy";
 
-/// Events fed into a running execution.
+/// Bounded wait for the forwarder to drain its backlog and close the channel
+/// once the execution finished or was abandoned. A remote stdin window that
+/// never reopens must not hold `execute` (and through it the session lock)
+/// hostage.
+const FORWARDER_JOIN: Duration = Duration::from_secs(10);
+
+/// Bounded wait for the forwarder's final channel-close request; the shared
+/// event loop it queues onto can itself be stuck on a dead transport.
+const FORWARDER_CLOSE: Duration = Duration::from_secs(2);
+
+/// Bounded wait for the channel tasks to end after the engine future was
+/// dropped mid-run; whatever is still stuck after this is aborted.
+const TASK_REAP: Duration = Duration::from_secs(5);
+
+/// Events on the daemon-to-engine stdin lane. `Eof` is an ordered frame: it
+/// must reach the remote behind all data, so it travels on the same lane
+/// instead of being expressed as a channel close.
 #[derive(Debug)]
-pub enum InputEvent {
-    Stdin(Vec<u8>),
-    StdinEof,
-    Signal(Signal),
+pub enum StdinEvent {
+    Data(Vec<u8>),
+    Eof,
 }
 
 /// Events a running execution emits.
@@ -129,14 +150,25 @@ async fn cleanup_stale(handle: &SshHandle, keep: &str) -> Result<()> {
 
 /// Run one command through `sp-serve` over a fresh exec channel.
 ///
-/// `input` receives stdin data / eof / signals; `output` receives forwarded
-/// stdout/stderr chunks. Send errors on `output` (client gone) are ignored so
-/// the remote side can still finish cleanly.
+/// `stdin` receives stdin data / eof with backpressure (the lane is awaited,
+/// never skipped: a full lane stalls the daemon's client reads instead of
+/// dropping data); `signals` receives signals; `output` receives forwarded
+/// stdout/stderr chunks, whose send errors (client gone) are ignored so the
+/// remote side can still finish cleanly.
+///
+/// This function always returns, and its tasks never outlive its future: every
+/// channel write is cancellable against a latched shutdown flag (russh parks
+/// data writes on the send-window notifier and channel Close never wakes
+/// them, see the forwarder below), the final joins are time-bounded, and a
+/// dropped future aborts the tasks via [`EngineTasks`]. Signals travel out of
+/// band (all but Kill) from a dedicated sender task, so they are delivered
+/// even while stdin writes are parked on a full window.
 pub async fn execute(
     handle: &SshHandle,
     serve_path: &str,
     req: &ExecRequest,
-    mut input: mpsc::Receiver<InputEvent>,
+    mut stdin: mpsc::Receiver<StdinEvent>,
+    mut signals: mpsc::Receiver<Signal>,
     output: mpsc::Sender<OutputEvent>,
 ) -> Result<ExecOutcome> {
     let channel = handle
@@ -154,10 +186,22 @@ pub async fn execute(
         .await
         .map_err(|e| Error::Remote(format!("send Exec frame: {e}")))?;
 
-    // Reader task owns wait() so the main loop can also select on input.
+    let (shutdown, shutdown_rx) = Shutdown::new();
+
+    // Reader task owns wait() so the control loop below can run alongside.
     let (msg_tx, mut msg_rx) = mpsc::channel(64);
+    let reader_shutdown = shutdown.clone();
+    let mut reader_wake = shutdown_rx.clone();
     let reader_task = tokio::spawn(async move {
-        while let Some(msg) = reader.wait().await {
+        loop {
+            let msg = tokio::select! {
+                m = reader.wait() => match m {
+                    Some(m) => m,
+                    // Channel closed or transport dead.
+                    None => break,
+                },
+                _ = reader_wake.changed() => break,
+            };
             let ev = match msg {
                 ChannelMsg::Data { data } => ChanEvent::Data(data.to_vec()),
                 ChannelMsg::ExtendedData { data, ext: 1 } => ChanEvent::Log(data.to_vec()),
@@ -169,95 +213,168 @@ pub async fn execute(
                 break;
             }
         }
+        // Channel gone: no WindowAdjust will ever arrive, so the forwarder's
+        // parked writes must be woken by us.
+        reader_shutdown.fire();
     });
 
-    // Frame forwarder owning the channel write half. The control loop below
-    // must never await a channel write: with the remote stdin window full
-    // (serve applying backpressure because the child is not reading) the
-    // write blocks, and that must not stall signal forwarding or completion.
-    // Signals get a dedicated lane with biased priority; stdin data is queued
-    // and only dropped - loudly - once every buffer in the pipeline is full.
-    let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(64);
-    let (sig_tx, mut sig_rx) = mpsc::channel::<Signal>(8);
-    let forwarder = tokio::spawn(async move {
-        let writer = writer;
-        let mut data_open = true;
-        loop {
-            if !data_open {
-                match sig_rx.recv().await {
-                    Some(sig) => {
-                        if send_frame(&writer, &ExecFrame::Signal(sig)).await.is_err() {
-                            break;
-                        }
-                    },
+    // The write half is shared by the forwarder (sole data-path writer) and
+    // the out-of-band signal sender below. ChannelWriteHalf is not Clone, but
+    // its methods take &self and only clone the event-loop sender internally,
+    // so an Arc suffices: both tasks enqueue whole SSH messages, and only the
+    // data path ever touches the send window.
+    let writer = Arc::new(writer);
+
+    // Out-of-band signal sender: consumes the signal lane and calls only
+    // writer.signal() - an SSH channel request that consumes no stdin window
+    // and writes no data frame. A dedicated task keeps this path alive while
+    // the forwarder is parked inside a data write on a full window, which is
+    // precisely when an interrupt must get through (the forwarder cannot
+    // serve the signal lane from inside that park). Each signal is then
+    // relayed to the forwarder's in-band lane for the compatibility frame.
+    let (inband_tx, mut inband_rx) = mpsc::channel::<Signal>(8);
+    let sig_writer = Arc::clone(&writer);
+    let mut sig_shutdown = shutdown_rx.clone();
+    let signal_sender = tokio::spawn(async move {
+        while let Some(sig) = tokio::select! {
+            sig = signals.recv() => sig,
+            _ = sig_shutdown.changed() => None,
+        } {
+            if goes_out_of_band(sig) {
+                let sent = tokio::select! {
+                    r = sig_writer.signal(russh_sig(sig)) => Some(r),
+                    _ = sig_shutdown.changed() => None,
+                };
+                match sent {
+                    Some(Ok(())) => {},
+                    Some(Err(e)) => warn!("out-of-band signal {}: {e}", sig.as_str()),
+                    // Shutdown mid-send: teardown owns the channel now.
                     None => break,
+                }
+            }
+            // In-band relay (compat path; the frame is ordered behind queued
+            // stdin data). Best-effort by design: a signal that went out of
+            // band is already delivered, so a drop here only loses its
+            // duplicate - except Kill, whose only delivery path this is.
+            if inband_tx.try_send(sig).is_err() {
+                if goes_out_of_band(sig) {
+                    warn!(
+                        "in-band signal lane full, dropping {} signal (out-of-band request \
+                         already sent)",
+                        sig.as_str()
+                    );
+                } else {
+                    warn!(
+                        "in-band signal lane full, dropping Kill signal; it has no out-of-band \
+                         fallback"
+                    );
+                }
+            }
+        }
+    });
+
+    // Frame forwarder: the sole data-path writer. Every write is selected
+    // against the shutdown flag: russh 0.63 parks data writes on the window
+    // notifier (`reserve_writable_chunk`), which only a WindowAdjust ever
+    // fires - a channel Close does not - and `ChannelWriteHalf` has no Drop
+    // impl, so without this a full stdin window (serve stopped reading) would
+    // park the task forever. Cancelling a data write mid-frame would leave a
+    // partial frame on the wire, so it happens on teardown only, when nobody
+    // reads the stream anymore; signals never cancel a write - out-of-band
+    // delivery lives in its own task above.
+    let fwd_writer = Arc::clone(&writer);
+    let mut fwd_shutdown = shutdown_rx.clone();
+    let forwarder = tokio::spawn(async move {
+        let writer = fwd_writer;
+        // False until Eof was sent (or the lane closed without one); only
+        // late signals are forwarded afterwards.
+        let mut stdin_open = true;
+        'main: loop {
+            if !stdin_open {
+                let sig = tokio::select! {
+                    sig = inband_rx.recv() => match sig {
+                        Some(sig) => sig,
+                        // In-band lane closed: the signal sender exited, the
+                        // engine side is done.
+                        None => break 'main,
+                    },
+                    _ = fwd_shutdown.changed() => break 'main,
+                };
+                if !send_signal_frame(&writer, &mut fwd_shutdown, sig).await {
+                    break 'main;
                 }
                 continue;
             }
             tokio::select! {
                 biased;
-                sig = sig_rx.recv() => {
+                // Signal frames first: control traffic may overtake queued
+                // stdin data (the request itself already went out of band).
+                sig = inband_rx.recv() => {
                     if let Some(sig) = sig
-                        && send_frame(&writer, &ExecFrame::Signal(sig)).await.is_err()
+                        && !send_signal_frame(&writer, &mut fwd_shutdown, sig).await
                     {
-                        break;
+                        break 'main;
                     }
                 },
-                d = data_rx.recv() => {
-                    if let Some(d) = d {
-                        if send_frame(&writer, &ExecFrame::StdinData(d)).await.is_err() {
-                            break;
-                        }
-                    } else {
-                        // Data lane closed and drained: forward EOF, then
-                        // stay alive for late signals.
-                        let _ = send_frame(&writer, &ExecFrame::StdinEof).await;
-                        data_open = false;
+                ev = stdin.recv() => {
+                    match ev {
+                        Some(StdinEvent::Data(d)) => {
+                            let frame = ExecFrame::StdinData(d);
+                            let sent = tokio::select! {
+                                r = send_frame(&writer, &frame) => r,
+                                _ = fwd_shutdown.changed() => break 'main,
+                            };
+                            if sent.is_err() {
+                                break 'main; // transport dead
+                            }
+                        },
+                        Some(StdinEvent::Eof) => {
+                            // Drains behind the data already queued on the
+                            // lane, which is what keeps EOF ordered.
+                            let frame = ExecFrame::StdinEof;
+                            let _ = tokio::select! {
+                                r = send_frame(&writer, &frame) => r,
+                                _ = fwd_shutdown.changed() => break 'main,
+                            };
+                            stdin_open = false;
+                        },
+                        // Lane closed without an Eof: the engine is being torn
+                        // down; do not synthesize an EOF for it.
+                        None => stdin_open = false,
                     }
                 },
+                _ = fwd_shutdown.changed() => break 'main,
             }
         }
-        let _ = writer.close().await;
+        // Best-effort close: tells the remote side the channel is over so it
+        // kills the process group. Bounded because the event loop underneath
+        // can itself be wedged.
+        if timeout(FORWARDER_CLOSE, writer.close()).await.is_err() {
+            warn!("exec channel close did not complete within {FORWARDER_CLOSE:?}");
+        }
     });
 
+    // Dropped (instead of finished) when the engine future is cancelled at
+    // any await point; see EngineTasks for what that guarantees.
+    let mut engine_tasks = EngineTasks {
+        shutdown,
+        // No teardown side effects: both exit on the shutdown flag and are
+        // simply aborted.
+        side_tasks: vec![reader_task, signal_sender],
+        forwarder: Some(forwarder),
+    };
+
+    // Control loop: decodes serve's output frames. It never touches the
+    // write half - stdin and signals are the lanes consumed above.
     let mut decoder = EventDecoder::new();
     let mut serve_log = ServeLog::default();
     let mut report: Option<ExitReport> = None;
     let mut serve_status: Option<u32> = None;
-    let mut input_open = true;
-    // The stdin data lane; set to None on EOF so the forwarder drains its
-    // backlog first and then sends StdinEof - in order behind the data.
-    let mut data_lane = Some(data_tx);
-    let sig_lane = sig_tx;
 
     'outer: loop {
-        enum Sel {
-            In(Option<InputEvent>),
-            Msg(Option<ChanEvent>),
-        }
-        let sel = tokio::select! {
-            ev = input.recv(), if input_open => Sel::In(ev),
-            ev = msg_rx.recv() => Sel::Msg(ev),
-        };
-        match sel {
-            Sel::In(Some(InputEvent::Stdin(d))) => {
-                if let Some(tx) = data_lane.as_ref()
-                    && tx.try_send(d).is_err()
-                {
-                    warn!("stdin backlog full, dropping stdin data");
-                }
-            },
-            Sel::In(Some(InputEvent::StdinEof)) => {
-                data_lane = None;
-            },
-            Sel::In(Some(InputEvent::Signal(s))) => {
-                if sig_lane.try_send(s).is_err() {
-                    warn!("signal lane full, dropping {} signal", s.as_str());
-                }
-            },
-            Sel::In(None) => input_open = false,
-            Sel::Msg(None | Some(ChanEvent::Closed)) => break,
-            Sel::Msg(Some(ChanEvent::Data(bytes))) => {
+        match msg_rx.recv().await {
+            None | Some(ChanEvent::Closed) => break,
+            Some(ChanEvent::Data(bytes)) => {
                 for frame in decoder.push(&bytes)? {
                     match frame {
                         EventFrame::Stdout(d) => {
@@ -274,19 +391,13 @@ pub async fn execute(
                     }
                 }
             },
-            Sel::Msg(Some(ChanEvent::Log(bytes))) => serve_log.feed(&bytes),
-            Sel::Msg(Some(ChanEvent::Status(s))) => serve_status = Some(s),
+            Some(ChanEvent::Log(bytes)) => serve_log.feed(&bytes),
+            Some(ChanEvent::Status(s)) => serve_status = Some(s),
         }
     }
 
-    reader_task.abort();
     serve_log.flush();
-    // Both lanes dropped: the forwarder drains its backlog, closes the write
-    // half and exits. Bounded - serve is on its way out once an Exit frame
-    // was seen or the channel closed, so a stalled window clears quickly.
-    drop(data_lane);
-    drop(sig_lane);
-    let _ = forwarder.await;
+    engine_tasks.finish().await;
 
     match report {
         Some(rep) => Ok(ExecOutcome {
@@ -299,6 +410,154 @@ pub async fn execute(
             "sp-serve closed the channel without an exit report (exit status {serve_status:?}); \
              see daemon log for its stderr"
         ))),
+    }
+}
+
+/// Latched shutdown flag shared by the channel tasks and the drop guard:
+/// every long-running await in them selects on `changed()`, which resolves
+/// for all receivers exactly once `fire` has been called (or the sender was
+/// dropped). `watch` instead of `Notify` because a bare notify permit can be
+/// missed by a task that has not reached its await point yet.
+#[derive(Clone)]
+struct Shutdown(Arc<watch::Sender<bool>>);
+
+impl Shutdown {
+    fn new() -> (Self, watch::Receiver<bool>) {
+        let (tx, rx) = watch::channel(false);
+        (Self(Arc::new(tx)), rx)
+    }
+
+    /// Idempotent.
+    fn fire(&self) {
+        let _ = self.0.send(true);
+    }
+}
+
+/// Owns the channel tasks so a cancelled engine future cannot leak them: the
+/// daemon's watchdog (or a dying runtime) drops `execute`'s future at an
+/// arbitrary await point. `finish` is the normal completion path; `Drop`
+/// covers every other one - it fires the shutdown flag first so the forwarder
+/// can still send the channel close (which makes the remote side kill the
+/// process group) and aborts whatever is still stuck after a grace period.
+/// Aborting a finished task is a no-op.
+struct EngineTasks {
+    shutdown: Shutdown,
+    /// Tasks without teardown side effects (channel reader, out-of-band
+    /// signal sender): they exit on the shutdown flag and are aborted
+    /// outright.
+    side_tasks: Vec<JoinHandle<()>>,
+    /// Owns the channel close; joined with a bound instead of aborted.
+    forwarder: Option<JoinHandle<()>>,
+}
+
+impl EngineTasks {
+    /// Normal completion: stop the side tasks, then let the forwarder drain
+    /// and close the channel - time-bounded, so `execute` always returns.
+    async fn finish(&mut self) {
+        self.shutdown.fire();
+        for task in std::mem::take(&mut self.side_tasks) {
+            task.abort();
+            let _ = task.await;
+        }
+        let Some(forwarder) = self.forwarder.take() else {
+            return;
+        };
+        let mut forwarder = forwarder;
+        if timeout(FORWARDER_JOIN, &mut forwarder).await.is_err() {
+            warn!(
+                "stdin forwarder did not finish within {FORWARDER_JOIN:?}; aborting it, the \
+                 channel stays open until the connection ends"
+            );
+            forwarder.abort();
+            let _ = forwarder.await;
+        }
+    }
+}
+
+impl Drop for EngineTasks {
+    fn drop(&mut self) {
+        self.shutdown.fire();
+        let mut side_tasks = std::mem::take(&mut self.side_tasks);
+        let Some(mut forwarder) = self.forwarder.take() else {
+            return;
+        };
+        let all_done = forwarder.is_finished() && side_tasks.iter().all(JoinHandle::is_finished);
+        if all_done {
+            return;
+        }
+        warn!("execution abandoned with channel tasks running; reaping them");
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let joined = timeout(TASK_REAP, async {
+                    for task in &mut side_tasks {
+                        let _ = task.await;
+                    }
+                    let _ = (&mut forwarder).await;
+                })
+                .await
+                .is_ok();
+                if !joined {
+                    warn!("channel tasks still stuck after shutdown; aborting");
+                    for task in &mut side_tasks {
+                        task.abort();
+                    }
+                    forwarder.abort();
+                    for task in side_tasks {
+                        let _ = task.await;
+                    }
+                    let _ = forwarder.await;
+                }
+            });
+        } else {
+            // No runtime (e.g. runtime shutdown dropping this future): abort
+            // still flags the tasks so they cannot run on.
+            for task in &mut side_tasks {
+                task.abort();
+            }
+            forwarder.abort();
+        }
+    }
+}
+
+/// Whether `sig` may travel as an out-of-band SSH channel request. Kill must
+/// not: sshd delivers channel signal requests to the serve process itself,
+/// not to the command's process group, and an uncatchable SIGKILL there kills
+/// serve before it can kill the group or report an exit (137). Kill travels
+/// in-band only, where serve does `kill_group(SIGKILL)` and still reports.
+fn goes_out_of_band(sig: Signal) -> bool {
+    sig != Signal::Kill
+}
+
+/// Send one in-band Signal frame, best-effort; returns false when the caller's
+/// loop must stop (shutdown fired or the transport is dead). The frame is the
+/// compatibility path - the out-of-band request (sent by the signal sender
+/// task, except for Kill) is what actually carries the signal.
+async fn send_signal_frame(
+    writer: &russh::ChannelWriteHalf<russh::client::Msg>,
+    shutdown: &mut watch::Receiver<bool>,
+    sig: Signal,
+) -> bool {
+    let frame = ExecFrame::Signal(sig);
+    match tokio::select! {
+        r = send_frame(writer, &frame) => Some(r),
+        _ = shutdown.changed() => None,
+    } {
+        Some(Ok(())) => true,
+        Some(Err(e)) => {
+            warn!("in-band signal frame {}: {e}", sig.as_str());
+            false
+        },
+        None => false,
+    }
+}
+
+/// sp-proto signal to the matching SSH channel-request signal.
+fn russh_sig(sig: Signal) -> russh::Sig {
+    match sig {
+        Signal::Int => russh::Sig::INT,
+        Signal::Term => russh::Sig::TERM,
+        Signal::Kill => russh::Sig::KILL,
+        Signal::Hup => russh::Sig::HUP,
     }
 }
 
@@ -453,4 +712,41 @@ async fn upload(handle: &SshHandle, path: &str, data: &[u8]) -> Result<()> {
 fn new_nonce() -> String {
     let bytes: [u8; 16] = rand::random();
     hex_simd::encode_to_string(bytes, hex_simd::AsciiCase::Lower)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_mapping_covers_every_sp_signal() {
+        // A wrong mapping silently signals the remote process with the wrong
+        // signal; the compiler cannot catch enum-to-enum drift.
+        assert!(matches!(russh_sig(Signal::Int), russh::Sig::INT));
+        assert!(matches!(russh_sig(Signal::Term), russh::Sig::TERM));
+        assert!(matches!(russh_sig(Signal::Kill), russh::Sig::KILL));
+        assert!(matches!(russh_sig(Signal::Hup), russh::Sig::HUP));
+    }
+
+    #[test]
+    fn only_kill_is_gated_off_the_out_of_band_path() {
+        // Out of band, sshd hands the request to serve itself; an
+        // uncatchable Kill would end serve without an exit report.
+        assert!(goes_out_of_band(Signal::Int));
+        assert!(goes_out_of_band(Signal::Term));
+        assert!(goes_out_of_band(Signal::Hup));
+        assert!(!goes_out_of_band(Signal::Kill));
+    }
+
+    #[tokio::test]
+    async fn shutdown_latches_for_later_awaiters() {
+        // The teardown guarantee relies on the flag being latched: a task that
+        // has not reached its `changed()` await yet must still observe an
+        // earlier fire().
+        let (shutdown, mut rx) = Shutdown::new();
+        shutdown.fire();
+        shutdown.fire(); // idempotent
+        assert!(rx.changed().await.is_ok());
+        assert!(*rx.borrow_and_update());
+    }
 }
