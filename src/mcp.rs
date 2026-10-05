@@ -12,6 +12,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::{
+    check_timeout_ms,
     client::{self, RunReport},
     config,
     proto::ExecRequest,
@@ -71,13 +72,17 @@ impl SpMcp {
     async fn exec(&self, params: Parameters<ExecParams>) -> Result<CallToolResult, McpError> {
         let host = resolve_host()?;
         let session = resolve_session(params.0.session.as_deref())?;
+        // Model-controlled input: an oversized value is a caller error, the
+        // command must not run.
+        let timeout_ms = params.0.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+        check_timeout_ms(timeout_ms).map_err(|e| McpError::invalid_params(e, None))?;
         let req = ExecRequest {
             host,
             command: params.0.command,
             args: Vec::new(),
             cwd: params.0.cwd,
             state: None,
-            timeout_ms: Some(params.0.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
+            timeout_ms: Some(timeout_ms),
             session: Some(session.as_str().to_owned()),
         };
         let (report, stdout, stderr) = call(req, Vec::new()).await?;
