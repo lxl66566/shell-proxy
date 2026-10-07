@@ -7,8 +7,6 @@
 //! stream payloads are raw bytes. [`ExecFrame`] flows from the initiator,
 //! [`EventFrame`] flows back.
 
-use std::io::ErrorKind;
-
 use bytes::{Buf, BytesMut};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -211,11 +209,17 @@ pub enum EventFrame {
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
 /// Read one initiator frame from a stream; `None` on clean EOF.
+///
+/// EOF is clean only at a frame boundary; a connection closed inside a header
+/// or payload surfaces as [`Error::Protocol`] instead of a bare io EOF, so a
+/// peer dying mid-frame is not mistaken for a normal shutdown.
 pub async fn read_exec_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<ExecFrame>> {
     read_frame_as(r, ExecKind::try_from, decode_exec).await
 }
 
 /// Read one responder frame from a stream; `None` on clean EOF.
+///
+/// See [`read_exec_frame`] for the mid-frame EOF semantics.
 pub async fn read_event_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<EventFrame>> {
     read_frame_as(r, EventKind::try_from, decode_event).await
 }
@@ -229,11 +233,22 @@ where
     R: AsyncRead + Unpin,
     F: Fn(u8) -> Result<K>,
 {
+    // Byte-counted header read: only zero bytes at the frame start is a clean
+    // EOF. read_exact would collapse a 4-of-5-byte header into the same
+    // UnexpectedEof, silently losing a truncated frame.
     let mut hdr = [0u8; 5];
-    match r.read_exact(&mut hdr).await {
-        Ok(_) => {},
-        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+    let mut filled = 0;
+    while filled < 5 {
+        let n = r.read(&mut hdr[filled..]).await?;
+        if n == 0 {
+            if filled == 0 {
+                return Ok(None);
+            }
+            return Err(Error::Protocol(format!(
+                "connection closed mid-frame: partial header ({filled}/5 bytes)"
+            )));
+        }
+        filled += n;
     }
     let kind = kind_of(hdr[0])?;
     let len = u32::from_le_bytes(hdr[1..5].try_into().expect("4 bytes")) as usize;
@@ -245,7 +260,10 @@ where
         // read_buf fills the reserved capacity directly: no zero-init pass.
         let n = r.read_buf(&mut payload).await?;
         if n == 0 {
-            return Err(std::io::Error::from(ErrorKind::UnexpectedEof).into());
+            return Err(Error::Protocol(format!(
+                "connection closed mid-frame: partial payload ({}/{len} bytes)",
+                payload.len()
+            )));
         }
     }
     decode(kind, payload).map(Some)
@@ -512,6 +530,30 @@ mod tests {
         let too_large = u32::try_from(MAX_PAYLOAD).unwrap() + 1;
         hdr.extend_from_slice(&too_large.to_le_bytes());
         assert!(dec.push(&hdr).is_err());
+    }
+
+    #[tokio::test]
+    async fn eof_mid_frame_is_a_protocol_error_not_clean_eof() {
+        let wire = encode_event_frame(&EventFrame::Stdout(vec![7; 10])).unwrap();
+
+        // EOF before any header byte: clean end of stream.
+        let mut cur = std::io::Cursor::new(Vec::new());
+        assert!(read_event_frame(&mut cur).await.unwrap().is_none());
+
+        // Truncation at every point inside the frame must be a protocol error
+        // naming the mid-frame close, never a clean EOF or a bare io error.
+        for take in 1..wire.len() {
+            let mut cur = std::io::Cursor::new(&wire[..take]);
+            match read_event_frame(&mut cur).await {
+                Err(Error::Protocol(msg)) => assert!(msg.contains("mid-frame"), "{msg}"),
+                other => panic!("expected protocol error at {take} bytes, got {other:?}"),
+            }
+        }
+
+        // Full frame then EOF stays clean.
+        let mut cur = std::io::Cursor::new(&wire);
+        assert!(read_event_frame(&mut cur).await.unwrap().is_some());
+        assert!(read_event_frame(&mut cur).await.unwrap().is_none());
     }
 
     #[tokio::test]
