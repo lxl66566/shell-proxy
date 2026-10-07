@@ -205,11 +205,13 @@ async fn execute(
                     }
                 },
                 Ok(Some(ExecFrame::Ping)) => {
-                    let _ = ping_tx
-                        .send(EventFrame::Pong(sp_proto::Pong {
-                            pid: std::process::id(),
-                        }))
-                        .await;
+                    // try_send: a blocking send would stall the router (and
+                    // its signal forwarding) behind output backpressure. A
+                    // dropped reply is tolerable - the link is full or gone;
+                    // the daemon does not ping today.
+                    let _ = ping_tx.try_send(EventFrame::Pong(sp_proto::Pong {
+                        pid: std::process::id(),
+                    }));
                 },
                 // One exec per process; a second request is a protocol violation.
                 Ok(Some(ExecFrame::Exec(_))) => {},
