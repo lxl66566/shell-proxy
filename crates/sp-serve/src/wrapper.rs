@@ -44,8 +44,11 @@ pub fn rc_body(stderr_fd: i32) -> String {
 ///   `declare -p` output is one safely quoted line per variable, so it round-trips through eval as
 ///   data, not syntax. It runs in a subshell so the unsets keeping wrapper internals and PWD/SP_CWD
 ///   out of the dump cannot clear `__sp_rc`, which the final `exit` still has to read;
-/// - errexit is dropped right after the command: a restored `set -e` plus a failing command would
-///   abort the wrapper before the cwd report and state dump run;
+/// - errexit is captured right before the epilogue disarms it (`set +e` is needed so a failing
+///   command cannot abort the cwd report and state dump) and appended to the dump as a final `set
+///   -o errexit` line when it was on. The flag travels as a subshell positional, which `declare -p`
+///   never dumps, so the helper variable stays out of the persisted state and the restored option
+///   engages only at the end of the restore eval;
 /// - the traps record the signal as a flag instead of exiting: bash runs a trap only after the
 ///   current foreground command finishes, so both a signal that killed the foreground child (eval
 ///   returns with 128+signum already in `$?`) and one that hit an idle bash still leave the
@@ -59,9 +62,10 @@ pub fn wrapper_body(cmd_fd: i32, restore_fd: i32, dump_fd: i32, pwd_fd: i32) -> 
          %s, using HOME\\n' \"$SP_CWD\" >&2; cd; }}\nfi\n__sp_sig=\ntrap '__sp_sig=130' INT\ntrap \
          '__sp_sig=143' TERM\ntrap '__sp_sig=129' HUP\n{{ eval \"$(cat /dev/fd/{restore_fd})\"; \
          }} 2>/dev/null\neval \"$(cat /dev/fd/{cmd_fd})\"\n__sp_rc=$?\n[ -n \"$__sp_sig\" ] && \
-         __sp_rc=$__sp_sig\nset +e\nprintf '%s\\0' \"$PWD\" >&{pwd_fd}\nexec 2>/dev/null\n( unset \
-         __sp_rc __sp_sig SP_CWD PWD; declare -p; declare -f; alias; shopt -p; set +o; umask -p; \
-         printf '\\0'; ) >&{dump_fd}\nexit \"$__sp_rc\"\n"
+         __sp_rc=$__sp_sig\n__sp_e=0; [[ $- == *e* ]] && __sp_e=1\nset +e\nprintf '%s\\0' \
+         \"$PWD\" >&{pwd_fd}\nexec 2>/dev/null\n( set -- \"$__sp_e\"; unset __sp_rc __sp_sig \
+         __sp_e SP_CWD PWD; declare -p; declare -f; alias; shopt -p; set +o; umask -p; [ \"$1\" = \
+         1 ] && printf '%s\\n' 'set -o errexit'; printf '\\0'; ) >&{dump_fd}\nexit \"$__sp_rc\"\n"
     )
 }
 
@@ -127,10 +131,12 @@ mod tests {
         let w = wrapper_body(9, 10, 12, 11);
         // The dump runs in a subshell: the unsets hide the wrapper internals
         // from `declare -p` without clearing `__sp_rc` for the final exit.
-        // PWD must stay the last unset word - bash records it in `_`, whose
-        // dumped value is then identical to a dump taken without the unsets.
+        // The errexit flag rides in a positional (never dumped) so it
+        // survives the unsets until the dump tail needs it. PWD must stay
+        // the last unset word - bash records it in `_`, whose dumped value
+        // is then identical to a dump taken without the unsets.
         let unset = w
-            .find("( unset __sp_rc __sp_sig SP_CWD PWD; declare -p;")
+            .find("( set -- \"$__sp_e\"; unset __sp_rc __sp_sig __sp_e SP_CWD PWD; declare -p;")
             .expect("unset inside the dump subshell");
         let dump_end = w.rfind(">&12").expect("dump redirect");
         assert!(unset < dump_end);
@@ -139,11 +145,32 @@ mod tests {
     }
 
     #[test]
+    fn errexit_is_captured_and_restored_via_the_dump() {
+        let w = wrapper_body(9, 10, 12, 11);
+        // Capture happens under the user's option state, right before the
+        // epilogue disarms errexit.
+        let capture = w
+            .find("__sp_e=0; [[ $- == *e* ]] && __sp_e=1")
+            .expect("errexit capture");
+        let off = w.find("set +e").expect("errexit disarmed");
+        assert!(capture < off);
+        // The dump tail restores errexit only when it was on, after the
+        // `set +o` lines that would otherwise leave it off.
+        let dump_tail = w
+            .find("[ \"$1\" = 1 ] && printf '%s\\n' 'set -o errexit'")
+            .expect("conditional errexit line");
+        let set_off_output = w.find("set +o").expect("set +o");
+        assert!(set_off_output < dump_tail);
+    }
+
+    #[test]
     fn reports_end_with_nul_terminator() {
         // A surviving background job holds the report pipes open, so serve
         // must rely on the terminator, not EOF, to know a report is complete.
         let w = wrapper_body(9, 10, 12, 11);
         assert!(w.contains("printf '%s\\0' \"$PWD\" >&11"));
-        assert!(w.contains("umask -p; printf '\\0'; ) >&12"));
+        assert!(
+            w.contains("[ \"$1\" = 1 ] && printf '%s\\n' 'set -o errexit'; printf '\\0'; ) >&12")
+        );
     }
 }
