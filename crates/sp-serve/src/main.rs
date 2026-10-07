@@ -14,8 +14,18 @@ mod serve;
 #[cfg(any(unix, test))]
 mod wrapper;
 
+fn main() {
+    // Exact `sp-serve <version>` format, no prefix or suffix: the daemon
+    // matches it to detect stale binaries deployed via SP_SERVE_* overrides.
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("sp-serve {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    serve_main();
+}
+
 #[cfg(unix)]
-fn main() -> ! {
+fn serve_main() -> ! {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -27,7 +37,7 @@ fn main() -> ! {
 }
 
 #[cfg(not(unix))]
-fn main() {
+fn serve_main() {
     eprintln!("sp-serve only runs on unix targets");
     std::process::exit(2);
 }

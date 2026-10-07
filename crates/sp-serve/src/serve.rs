@@ -25,10 +25,12 @@ use crate::child::{self, Spawned};
 /// Give the daemon this long to send the Exec frame before giving up.
 const EXEC_WAIT: Duration = Duration::from_secs(30);
 
-/// How long to keep draining child pipes after the exit status, so tail bytes
-/// are not lost. A job surviving the command (`nohup ... &`) inherits the
-/// pipes and never EOFs; past the grace the pumps are aborted and any further
-/// output is dropped.
+/// How long the drain phase may make no output progress before the pumps
+/// are aborted. Progress is measured at the writer: every frame pushed out
+/// resets the deadline, so a slow but consuming chain (full SSH window,
+/// slow client pipe) is never cut; only output stalled for the whole grace
+/// (a job surviving the command (`nohup ... &`) holding the pipes with
+/// nothing to send) is dropped.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Grace between the timeout TERM and the escalating KILL, so remote cleanup
@@ -57,6 +59,10 @@ pub async fn run() -> i32 {
 }
 
 async fn inner() -> Result<()> {
+    // Startup identity line, same exact `sp-serve <version>` format as
+    // `--version`: it travels as SSH extended data into the daemon log,
+    // making a stale binary deployed via SP_SERVE_* overrides visible there.
+    eprintln!("sp-serve {}", env!("CARGO_PKG_VERSION"));
     // Intercept INT/TERM/HUP before anything runs. sshd delivers the daemon's
     // out-of-band signal requests (SSH channel requests) straight to this
     // process; under the default dispositions they would kill serve on the
@@ -119,8 +125,11 @@ async fn execute(
         .try_into()
         .context("pid does not fit i32")?;
 
-    // Single stdout writer keeps frames ordered.
+    // Single stdout writer keeps frames ordered. It also emits a progress
+    // tick per written frame, which backs the no-progress deadline of the
+    // drain phase (see [`drain_pumps`]).
     let (out_tx, mut out_rx) = mpsc::channel::<EventFrame>(256);
+    let (progress_tx, mut progress_rx) = tokio::sync::watch::channel(0u64);
     let (dead_tx, dead_rx) = tokio::sync::oneshot::channel::<()>();
     let writer = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
@@ -130,6 +139,7 @@ async fn execute(
             {
                 break;
             }
+            progress_tx.send_modify(|n| *n += 1);
         }
         // Daemon gone: output can no longer be delivered.
         let _ = dead_tx.send(());
@@ -195,14 +205,17 @@ async fn execute(
                     }
                 },
                 Ok(Some(ExecFrame::Ping)) => {
-                    let _ = ping_tx
-                        .send(EventFrame::Pong(sp_proto::Pong {
-                            pid: std::process::id(),
-                        }))
-                        .await;
+                    // try_send: a blocking send would stall the router (and
+                    // its signal forwarding) behind output backpressure. A
+                    // dropped reply is tolerable - the link is full or gone;
+                    // the daemon does not ping today.
+                    let _ = ping_tx.try_send(EventFrame::Pong(sp_proto::Pong {
+                        pid: std::process::id(),
+                    }));
                 },
-                // One exec per process; a second request is a protocol violation.
-                Ok(Some(ExecFrame::Exec(_))) => {},
+                // One exec per process; a second request is a protocol
+                // violation. It is ignored, but not silently.
+                Ok(Some(ExecFrame::Exec(_))) => log("ignoring a second Exec frame"),
                 Ok(None) => {
                     let _ = ctrl_tx.send(Ctrl::Closed).await;
                     break;
@@ -248,6 +261,10 @@ async fn execute(
     let mut wait = std::pin::pin!(child.wait());
     let mut timed_out = false;
     let mut ctrl_open = true;
+    // A writer that dies without observing a send failure (panic, abort)
+    // leaves the oneshot permanently Ready(Err); the flag keeps the select
+    // from spinning on it for the rest of the run.
+    let mut dead_done = false;
 
     let status = loop {
         let sel = tokio::select! {
@@ -261,7 +278,7 @@ async fn execute(
                     None => std::future::pending().await,
                 }
             }, if kill_deadline.is_some() || term_deadline.is_some() => Sel::Timeout,
-            d = &mut dead_rx => Sel::Dead(d.is_ok()),
+            d = &mut dead_rx, if !dead_done => Sel::Dead(d.is_ok()),
         };
         match sel {
             Sel::Ctrl(Some(Ctrl::Signal(s))) => {
@@ -313,6 +330,7 @@ async fn execute(
                 }
             },
             Sel::Dead(d) => {
+                dead_done = true;
                 if d {
                     kill_group_raw(pgid, libc::SIGKILL);
                     bail!("daemon vanished while the command was running");
@@ -321,38 +339,52 @@ async fn execute(
         }
     };
 
+    // A leader that dies inside the TERM grace breaks the loop before the
+    // escalation branch fires; TERM-immune group members (`trap '' TERM`)
+    // would survive as orphans. Make up the skipped KILL (a no-op for a
+    // dead group), like `timeout -k`. An armed kill_deadline here means the
+    // escalation has not fired yet.
+    if kill_deadline.is_some() {
+        log(&format!(
+            "leader exited within the kill grace, sending KILL to pgid {pgid}"
+        ));
+        kill_group_raw(pgid, libc::SIGKILL);
+    }
+
     // The router holds an out_tx clone for Ping replies; it must be gone
     // before the writer task can observe channel closure.
     route.abort();
 
-    let code = status_code(&status);
+    let code = status_code(status);
     // Drain tail output. Orphaned jobs holding the pipes open must not block
-    // us: past the grace the pumps are aborted, not merely detached - a
-    // detached pump keeps its writer sender alive, so the writer (and the Exit
-    // frame behind it) would wait on a channel that cannot close until the
-    // last orphan exits.
-    if tokio::time::timeout(DRAIN_GRACE, async {
-        let _ = (&mut out_pump).await;
-        let _ = (&mut err_pump).await;
-    })
-    .await
-    .is_err()
-    {
-        log("drain grace elapsed with output pipes still open (orphan job?); dropping tail");
+    // us: once output stops making progress the pumps are aborted, not
+    // merely detached - a detached pump keeps its writer sender alive, so
+    // the writer (and the Exit frame behind it) would wait on a channel
+    // that cannot close until the last orphan exits.
+    if !drain_pumps(&mut out_pump, &mut err_pump, &mut progress_rx).await {
+        log("output made no progress for the drain grace (orphan job?); dropping tail");
         out_pump.abort();
         err_pump.abort();
     }
     let new_cwd = match tokio::time::timeout(DRAIN_GRACE, cwd_collect).await {
         Ok(Ok(Some(cwd))) => Some(cwd),
         Ok(Ok(None)) => None,
-        _ => {
+        Ok(Err(e)) => {
+            log(&format!("cwd report task failed: {e}; cwd unchanged"));
+            None
+        },
+        Err(_) => {
             log("cwd report did not terminate in time; cwd unchanged");
             None
         },
     };
     let new_state = match tokio::time::timeout(DRAIN_GRACE, state_collect).await {
         Ok(Ok(state)) => state,
-        _ => {
+        Ok(Err(e)) => {
+            log(&format!("state dump task failed: {e}; state unchanged"));
+            None
+        },
+        Err(_) => {
             log("state dump did not terminate in time; state unchanged");
             None
         },
@@ -517,6 +549,50 @@ where
     })
 }
 
+/// Wait for both output pumps to finish under a no-progress deadline.
+///
+/// Returns `true` when both finished. Every frame the writer flushes resets
+/// the [`DRAIN_GRACE`] deadline, so a slow but consuming chain never runs it
+/// out; only output that stays stalled for the whole grace - an orphan job
+/// holding the pipes open with nothing to send - is treated as undrainable.
+/// Losing the writer (its progress sender dropped) also returns `false`:
+/// nothing can consume the pumps anymore.
+async fn drain_pumps(
+    out_pump: &mut tokio::task::JoinHandle<()>,
+    err_pump: &mut tokio::task::JoinHandle<()>,
+    progress: &mut tokio::sync::watch::Receiver<u64>,
+) -> bool {
+    fn deadline() -> Option<Instant> {
+        Instant::now().checked_add(DRAIN_GRACE)
+    }
+    let mut out_done = false;
+    let mut err_done = false;
+    // The clock cannot represent the grace only at the very end of its
+    // range; treat that as stalled rather than waiting forever.
+    let Some(mut stop_at) = deadline() else {
+        return false;
+    };
+    loop {
+        if out_done && err_done {
+            return true;
+        }
+        tokio::select! {
+            _ = &mut *out_pump, if !out_done => out_done = true,
+            _ = &mut *err_pump, if !err_done => err_done = true,
+            changed = progress.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+                match deadline() {
+                    Some(d) => stop_at = d,
+                    None => return false,
+                }
+            },
+            () = tokio::time::sleep_until(stop_at) => return false,
+        }
+    }
+}
+
 /// Signal the whole process group of the child.
 fn kill_group(pgid: i32, sig: Signal) {
     kill_group_raw(pgid, sig.as_raw());
@@ -533,7 +609,7 @@ fn kill_group_raw(pgid: i32, sig: i32) {
 }
 
 /// Exit code from a wait status: normal code, or 128+signum like a shell.
-fn status_code(status: &std::process::ExitStatus) -> i32 {
+fn status_code(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     if let Some(c) = status.code() {
         return c;
