@@ -43,20 +43,17 @@ fn main() {
             .filter(|p| p.is_file())
             .or_else(|| candidate.is_file().then(|| candidate.clone()));
         let dest = out_dir.join(out_name);
-        match src {
-            Some(p) => {
-                println!("cargo:rerun-if-changed={}", p.display());
-                std::fs::copy(&p, &dest).expect("copy sp-serve binary");
-            },
-            None => {
-                println!(
-                    "cargo:warning={env_var} is not set and {} was not found; embedding an empty \
-                     placeholder. Remote deploy will fail until you cross-build sp-serve there or \
-                     point {env_var} at the binary",
-                    candidate.display()
-                );
-                std::fs::write(&dest, []).expect("write empty placeholder");
-            },
+        if let Some(p) = src {
+            println!("cargo:rerun-if-changed={}", p.display());
+            std::fs::copy(&p, &dest).expect("copy sp-serve binary");
+        } else {
+            println!(
+                "cargo:warning={env_var} is not set and {} was not found; embedding an empty \
+                 placeholder. Remote deploy will fail until you cross-build sp-serve there or \
+                 point {env_var} at the binary",
+                candidate.display()
+            );
+            std::fs::write(&dest, []).expect("write empty placeholder");
         }
     }
 }
