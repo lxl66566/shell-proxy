@@ -59,6 +59,10 @@ pub async fn run() -> i32 {
 }
 
 async fn inner() -> Result<()> {
+    // Startup identity line, same exact `sp-serve <version>` format as
+    // `--version`: it travels as SSH extended data into the daemon log,
+    // making a stale binary deployed via SP_SERVE_* overrides visible there.
+    eprintln!("sp-serve {}", env!("CARGO_PKG_VERSION"));
     // Intercept INT/TERM/HUP before anything runs. sshd delivers the daemon's
     // out-of-band signal requests (SSH channel requests) straight to this
     // process; under the default dispositions they would kill serve on the
