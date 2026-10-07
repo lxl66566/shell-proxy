@@ -209,11 +209,20 @@ fn parse_ssh_g_output(host: &str, text: &str) -> Result<ResolvedHost> {
 
     // ProxyJump is materialized by OpenSSH into a ProxyCommand; build one ourselves
     // in case only the jump field is set. Tokens in the jump spec are expanded
-    // with the target's hostname/port/user, like OpenSSH does.
+    // with the target's hostname/port/user, like OpenSSH does; inserted values
+    // are percent-escaped for `cmd /C` on Windows.
+    let escape = cfg!(windows);
     let proxy_command = proxy_command.or_else(|| {
         proxy_jump.map(|jump| {
-            let jump = expand_tokens(&jump, &hostname, port, &user, local_user().as_deref());
-            format!("ssh -W [{hostname}]:{port} {jump}")
+            let jump = expand_tokens(
+                &jump,
+                &hostname,
+                port,
+                &user,
+                local_user().as_deref(),
+                escape,
+            );
+            format!("ssh -W [{}]:{port} {jump}", insert_value(&hostname, escape))
         })
     });
 
@@ -237,6 +246,17 @@ fn parse_ssh_g_output(host: &str, text: &str) -> Result<ResolvedHost> {
     })
 }
 
+/// Value inserted into a ProxyCommand string. On Windows the command runs
+/// through `cmd /C`, which expands `%VAR%` references: a literal `%` in a
+/// hostname, port or user must be doubled so it survives verbatim.
+fn insert_value(v: &str, escape: bool) -> String {
+    if escape {
+        v.replace('%', "%%")
+    } else {
+        v.to_owned()
+    }
+}
+
 /// Expand ProxyCommand tokens in a single left-to-right pass: `%%`, `%h`,
 /// `%n`, `%p`, `%r`, `%u`. Tokens sp cannot expand (`%C`, `%d`, `%f`, ...) are
 /// left verbatim for the command to interpret.
@@ -246,9 +266,12 @@ fn expand_tokens(
     port: u16,
     user: &str,
     local_user: Option<&str>,
+    escape: bool,
 ) -> String {
     // %n is the pre-canonicalization hostname, which sp does not keep; the
     // resolved hostname is the closest equivalent.
+    let hostname = insert_value(hostname, escape);
+    let user = insert_value(user, escape);
     let mut out = String::with_capacity(cmd.len());
     let mut chars = cmd.chars();
     while let Some(c) = chars.next() {
@@ -259,12 +282,12 @@ fn expand_tokens(
         match chars.next() {
             // Trailing or doubled percent: a literal percent.
             Some('%') | None => out.push('%'),
-            Some('h' | 'n') => out.push_str(hostname),
+            Some('h' | 'n') => out.push_str(&hostname),
             Some('p') => out.push_str(&port.to_string()),
-            Some('r') => out.push_str(user),
+            Some('r') => out.push_str(&user),
             // %u is the local username; kept verbatim when it is unknown.
             Some('u') => match local_user {
-                Some(u) => out.push_str(u),
+                Some(u) => out.push_str(&insert_value(u, escape)),
                 None => out.push_str("%u"),
             },
             // Unknown token: keep verbatim.
@@ -280,7 +303,14 @@ fn expand_tokens(
 /// Expand %h/%p/%n/%r/%u tokens in a ProxyCommand.
 #[must_use]
 pub fn expand_proxy_command(cmd: &str, hostname: &str, port: u16, user: &str) -> String {
-    expand_tokens(cmd, hostname, port, user, local_user().as_deref())
+    expand_tokens(
+        cmd,
+        hostname,
+        port,
+        user,
+        local_user().as_deref(),
+        cfg!(windows),
+    )
 }
 
 /// Expand a leading `~` to the user's home directory (`ssh -G` emits `~/...`).
@@ -451,16 +481,48 @@ proxyjump u2@jump%h:2222
     #[test]
     fn expand_proxy_command_tokens() {
         assert_eq!(
-            expand_tokens("nc %h %p %%", "h1", 22, "r1", Some("lu")),
+            expand_tokens("nc %h %p %%", "h1", 22, "r1", Some("lu"), false),
             "nc h1 22 %"
         );
         assert_eq!(
-            expand_tokens("ssh -l %r -o User=%u %n:%p", "h1", 2200, "r1", Some("lu")),
+            expand_tokens(
+                "ssh -l %r -o User=%u %n:%p",
+                "h1",
+                2200,
+                "r1",
+                Some("lu"),
+                false
+            ),
             "ssh -l r1 -o User=lu h1:2200"
         );
         // %u stays verbatim when the local user is unknown; unknown tokens
         // and a trailing percent are preserved.
-        assert_eq!(expand_tokens("x %u %d %", "h", 22, "r", None), "x %u %d %");
+        assert_eq!(
+            expand_tokens("x %u %d %", "h", 22, "r", None, false),
+            "x %u %d %"
+        );
+    }
+
+    #[test]
+    fn inserted_values_are_percent_escaped_for_cmd() {
+        assert_eq!(insert_value("a%b", true), "a%%b");
+        assert_eq!(insert_value("a%b", false), "a%b");
+        // With escaping, a hostname containing % survives `cmd /C` expansion.
+        assert_eq!(
+            expand_tokens("nc %h %p", "h%1", 22, "r%2", None, true),
+            "nc h%%1 22"
+        );
+        assert_eq!(
+            expand_tokens("nc %h %r", "h%1", 22, "r%2", Some("u%3"), true),
+            "nc h%%1 r%%2"
+        );
+        // The public entry point escapes only on Windows.
+        let expanded = expand_proxy_command("nc %h", "h%1", 22, "r");
+        if cfg!(windows) {
+            assert_eq!(expanded, "nc h%%1");
+        } else {
+            assert_eq!(expanded, "nc h%1");
+        }
     }
 
     #[test]
