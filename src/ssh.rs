@@ -630,22 +630,44 @@ impl PublickeyBudget {
         !self.offered || self.attempts >= MAX_PUBLICKEY_ATTEMPTS
     }
 
-    /// Record one attempt result; returns true when it succeeded.
-    fn record<E>(&mut self, result: std::result::Result<client::AuthResult, E>) -> bool {
+    /// Record one attempt result.
+    fn record<E>(&mut self, result: std::result::Result<client::AuthResult, E>) -> AuthAttempt {
         self.attempts += 1;
         match result {
-            Ok(client::AuthResult::Success) => true,
+            Ok(client::AuthResult::Success) => AuthAttempt::Success,
             Ok(client::AuthResult::Failure {
                 remaining_methods, ..
             }) => {
                 if !remaining_methods.contains(&MethodKind::PublicKey) {
                     self.offered = false;
                 }
-                false
+                AuthAttempt::Rejected
             },
-            Err(_) => false,
+            // Whether this is a transport failure or, on the agent path, a
+            // per-identity agent error, the attempt did not succeed.
+            Err(_) => AuthAttempt::Failed,
         }
     }
+}
+
+/// Outcome of a single authentication attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum AuthAttempt {
+    Success,
+    /// The server rejected the attempt; further tries may still work.
+    Rejected,
+    /// Transport or signer error.
+    Failed,
+}
+
+/// RSA signature hash selection for identity files.
+enum RsaHashPlan {
+    /// The server advertised its algorithms: one attempt with this hash
+    /// (`None` means the server only accepts ssh-rsa/SHA-1).
+    Fixed(Option<HashAlg>),
+    /// The server did not advertise (no EXT_INFO): start at Sha512 and
+    /// downgrade for pre-rsa-sha2 servers.
+    Downgrade,
 }
 
 async fn authenticate(handle: &mut SshHandle, resolved: &ResolvedHost) -> Result<()> {
@@ -666,19 +688,22 @@ async fn authenticate(handle: &mut SshHandle, resolved: &ResolvedHost) -> Result
             let result = handle
                 .authenticate_publickey_with(&user, pubkey, None, &mut agent)
                 .await;
-            if budget.record(result) {
+            if budget.record(result) == AuthAttempt::Success {
                 return Ok(());
             }
         }
     }
 
     // 2. identity files
+    // Queried once, at the first RSA identity: the server's advertised
+    // RSA hash algorithm, when it sends the server-sig-algs extension.
+    let mut rsa_plan: Option<RsaHashPlan> = None;
     for path in &resolved.identity_files {
         if budget.exhausted() {
             break;
         }
         let key = match keys::load_secret_key(path, None) {
-            Ok(k) => k,
+            Ok(k) => Arc::new(k),
             Err(keys::Error::KeyIsEncrypted) => {
                 attempts.push(format!(
                     "{}: encrypted, add it to ssh-agent",
@@ -688,17 +713,40 @@ async fn authenticate(handle: &mut SshHandle, resolved: &ResolvedHost) -> Result
             },
             Err(_) => continue, // missing/unreadable is normal, ssh skips too
         };
-        let hash = if key.algorithm().is_rsa() {
-            Some(HashAlg::Sha512)
+        let hashes: &[Option<HashAlg>] = if key.algorithm().is_rsa() {
+            if rsa_plan.is_none() {
+                // `Ok(Some(alg))`: the server advertised its algorithms.
+                // `Ok(None)`: no server-sig-algs extension was sent, so the
+                // hash is probed with a downgrade chain instead.
+                rsa_plan = Some(match handle.best_supported_rsa_hash().await {
+                    Ok(Some(alg)) => RsaHashPlan::Fixed(alg),
+                    Ok(None) | Err(_) => RsaHashPlan::Downgrade,
+                });
+            }
+            match rsa_plan.as_ref() {
+                Some(RsaHashPlan::Fixed(hash)) => std::slice::from_ref(hash),
+                _ => &[Some(HashAlg::Sha512), Some(HashAlg::Sha256), None],
+            }
         } else {
-            None
+            &[None]
         };
-        let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
-        let result = handle.authenticate_publickey(&user, key_with_hash).await;
-        if budget.record(result) {
-            return Ok(());
+        let mut rejected = false;
+        for hash in hashes {
+            if budget.exhausted() {
+                break;
+            }
+            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::clone(&key), *hash);
+            let result = handle.authenticate_publickey(&user, key_with_hash).await;
+            match budget.record(result) {
+                AuthAttempt::Success => return Ok(()),
+                // Only a server rejection justifies a downgrade retry.
+                AuthAttempt::Rejected => rejected = true,
+                AuthAttempt::Failed => break,
+            }
         }
-        attempts.push(format!("{}: rejected", path.display()));
+        if rejected {
+            attempts.push(format!("{}: rejected", path.display()));
+        }
     }
 
     if !budget.offered {
@@ -1083,24 +1131,40 @@ mod tests {
                 partial_success: false,
             }
         };
-        // Repeated failures stop at the attempt cap.
+        // Repeated rejections stop at the attempt cap.
         let mut budget = PublickeyBudget::new();
         for _ in 0..(MAX_PUBLICKEY_ATTEMPTS - 1) {
-            assert!(!budget.record::<std::convert::Infallible>(Ok(failure(true))));
+            assert_eq!(
+                budget.record::<std::convert::Infallible>(Ok(failure(true))),
+                AuthAttempt::Rejected
+            );
             assert!(!budget.exhausted());
         }
-        assert!(!budget.record::<std::convert::Infallible>(Ok(failure(true))));
+        assert_eq!(
+            budget.record::<std::convert::Infallible>(Ok(failure(true))),
+            AuthAttempt::Rejected
+        );
         assert!(budget.exhausted());
         assert!(budget.offered);
 
         // A reply that stops offering publickey ends the method immediately.
         let mut budget = PublickeyBudget::new();
-        assert!(!budget.record::<std::convert::Infallible>(Ok(failure(false))));
+        assert_eq!(
+            budget.record::<std::convert::Infallible>(Ok(failure(false))),
+            AuthAttempt::Rejected
+        );
         assert!(budget.exhausted());
         assert!(!budget.offered);
 
-        // Success wins over the counters.
+        // Success and transport failure are told apart.
         let mut budget = PublickeyBudget::new();
-        assert!(budget.record::<std::convert::Infallible>(Ok(client::AuthResult::Success)));
+        assert_eq!(
+            budget.record::<std::convert::Infallible>(Ok(client::AuthResult::Success)),
+            AuthAttempt::Success
+        );
+        assert_eq!(
+            budget.record::<russh::Error>(Err(russh::Error::SendError)),
+            AuthAttempt::Failed
+        );
     }
 }
