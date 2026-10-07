@@ -2011,6 +2011,7 @@ dependencies = [
 name = "sp-proto"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "libc",
  "serde",
  "serde_json",

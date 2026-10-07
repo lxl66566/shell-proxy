@@ -9,6 +9,7 @@
 
 use std::io::ErrorKind;
 
+use bytes::{Buf, BytesMut};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -239,16 +240,28 @@ where
     if len > MAX_PAYLOAD {
         return Err(Error::Protocol(format!("frame too large: {len}")));
     }
-    let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload).await?;
+    let mut payload = Vec::with_capacity(len);
+    while payload.len() < len {
+        // read_buf fills the reserved capacity directly: no zero-init pass.
+        let n = r.read_buf(&mut payload).await?;
+        if n == 0 {
+            return Err(std::io::Error::from(ErrorKind::UnexpectedEof).into());
+        }
+    }
     decode(kind, payload).map(Some)
 }
+
+/// Buffer capacity kept across pushes once fully consumed; anything larger
+/// (a max-size frame passed through) is released. Comfortably above the
+/// ~32 KiB chunks the SSH hop delivers, so steady-state decoding never
+/// re-allocates.
+const KEEP_CAPACITY: usize = 256 * 1024;
 
 /// Incremental decoder for a responder frame stream arriving as byte chunks
 /// (SSH channel data). Feed chunks with [`EventDecoder::push`].
 #[derive(Default)]
 pub struct EventDecoder {
-    buf: Vec<u8>,
+    buf: BytesMut,
 }
 
 impl EventDecoder {
@@ -274,8 +287,12 @@ impl EventDecoder {
             }
             let kind = EventKind::try_from(self.buf[0])?;
             let payload = self.buf[5..5 + len].to_vec();
-            self.buf.drain(..5 + len);
+            // advance consumes in O(1); drain would memmove the remainder.
+            self.buf.advance(5 + len);
             out.push(decode_event(kind, payload)?);
+        }
+        if self.buf.is_empty() && self.buf.capacity() > KEEP_CAPACITY {
+            self.buf = BytesMut::new();
         }
         Ok(out)
     }
