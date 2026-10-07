@@ -8,6 +8,7 @@ use std::{
 };
 
 use russh::{
+    MethodKind,
     client::{self, Handle},
     keys::{
         self, HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate,
@@ -604,29 +605,78 @@ fn spawn_proxy(cmd: &str) -> std::io::Result<(ProxyStream, Child)> {
     Ok((stream, child))
 }
 
+/// Servers count every authentication request (including the unsigned
+/// publickey probes russh sends first) toward `MaxAuthTries` (OpenSSH
+/// default 6) and disconnect once it is exceeded.
+const MAX_PUBLICKEY_ATTEMPTS: usize = 6;
+
+/// Shared publickey attempt state across the agent and identity-file paths.
+struct PublickeyBudget {
+    attempts: usize,
+    /// False once a failure reply no longer offers publickey.
+    offered: bool,
+}
+
+impl PublickeyBudget {
+    fn new() -> Self {
+        Self {
+            attempts: 0,
+            offered: true,
+        }
+    }
+
+    /// True when no further publickey attempt should be made.
+    fn exhausted(&self) -> bool {
+        !self.offered || self.attempts >= MAX_PUBLICKEY_ATTEMPTS
+    }
+
+    /// Record one attempt result; returns true when it succeeded.
+    fn record<E>(&mut self, result: std::result::Result<client::AuthResult, E>) -> bool {
+        self.attempts += 1;
+        match result {
+            Ok(client::AuthResult::Success) => true,
+            Ok(client::AuthResult::Failure {
+                remaining_methods, ..
+            }) => {
+                if !remaining_methods.contains(&MethodKind::PublicKey) {
+                    self.offered = false;
+                }
+                false
+            },
+            Err(_) => false,
+        }
+    }
+}
+
 async fn authenticate(handle: &mut SshHandle, resolved: &ResolvedHost) -> Result<()> {
     let user = resolved.user.clone();
+    let mut attempts: Vec<String> = Vec::new();
+    let mut budget = PublickeyBudget::new();
 
-    // 1. ssh-agent
+    // 1. ssh-agent: a large keyring must not exhaust the server's auth
+    // budget before the identity files get their turn.
     if let Ok(mut agent) = connect_agent().await
         && let Ok(identities) = agent.request_identities().await
     {
         for identity in identities {
+            if budget.exhausted() {
+                break;
+            }
             let pubkey = identity.public_key().into_owned();
-            if matches!(
-                handle
-                    .authenticate_publickey_with(&user, pubkey, None, &mut agent)
-                    .await,
-                Ok(client::AuthResult::Success)
-            ) {
+            let result = handle
+                .authenticate_publickey_with(&user, pubkey, None, &mut agent)
+                .await;
+            if budget.record(result) {
                 return Ok(());
             }
         }
     }
 
     // 2. identity files
-    let mut attempts: Vec<String> = Vec::new();
     for path in &resolved.identity_files {
+        if budget.exhausted() {
+            break;
+        }
         let key = match keys::load_secret_key(path, None) {
             Ok(k) => k,
             Err(keys::Error::KeyIsEncrypted) => {
@@ -644,10 +694,20 @@ async fn authenticate(handle: &mut SshHandle, resolved: &ResolvedHost) -> Result
             None
         };
         let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
-        match handle.authenticate_publickey(&user, key_with_hash).await {
-            Ok(client::AuthResult::Success) => return Ok(()),
-            _ => attempts.push(format!("{}: rejected", path.display())),
+        let result = handle.authenticate_publickey(&user, key_with_hash).await;
+        if budget.record(result) {
+            return Ok(());
         }
+        attempts.push(format!("{}: rejected", path.display()));
+    }
+
+    if !budget.offered {
+        attempts.push("server stopped offering publickey authentication".into());
+    }
+    if budget.attempts >= MAX_PUBLICKEY_ATTEMPTS && budget.offered {
+        attempts.push(format!(
+            "publickey attempt budget of {MAX_PUBLICKEY_ATTEMPTS} exhausted"
+        ));
     }
 
     Err(Error::Auth(format!(
@@ -676,6 +736,8 @@ async fn connect_agent() -> std::result::Result<AgentClient<tokio::net::UnixStre
 
 #[cfg(test)]
 mod tests {
+    use russh::MethodSet;
+
     use super::*;
 
     #[test]
@@ -837,7 +899,7 @@ mod tests {
     const K2_B64: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXX9OIeZJ";
 
     fn scan(text: &str, lookup: &str, key: &ssh_key::PublicKey) -> KnownHostCheck {
-        scan_known_hosts(&text, lookup, key, false)
+        scan_known_hosts(text, lookup, key, false)
     }
 
     #[test]
@@ -958,7 +1020,7 @@ mod tests {
     fn scan_malformed_line_for_our_host_blocks() {
         let (k1, _k2, _ke) = test_keys();
         let text = "h ssh-ed25519 !!!not-base64!!!\n";
-        match scan(&text, "h", &k1) {
+        match scan(text, "h", &k1) {
             KnownHostCheck::Malformed { detail } => assert_eq!(detail, "line 1"),
             other => panic!("expected malformed, got {other:?}"),
         }
@@ -1006,5 +1068,39 @@ mod tests {
             decide_certificate("h:22", "h", 22, false, &[], &k1),
             HostKeyDecision::Accept
         ));
+    }
+
+    #[test]
+    fn publickey_budget_bounds_attempts() {
+        let failure = |offered: bool| {
+            let methods: &[MethodKind] = if offered {
+                &[MethodKind::PublicKey, MethodKind::Password]
+            } else {
+                &[MethodKind::Password]
+            };
+            client::AuthResult::Failure {
+                remaining_methods: MethodSet::from(methods),
+                partial_success: false,
+            }
+        };
+        // Repeated failures stop at the attempt cap.
+        let mut budget = PublickeyBudget::new();
+        for _ in 0..(MAX_PUBLICKEY_ATTEMPTS - 1) {
+            assert!(!budget.record::<std::convert::Infallible>(Ok(failure(true))));
+            assert!(!budget.exhausted());
+        }
+        assert!(!budget.record::<std::convert::Infallible>(Ok(failure(true))));
+        assert!(budget.exhausted());
+        assert!(budget.offered);
+
+        // A reply that stops offering publickey ends the method immediately.
+        let mut budget = PublickeyBudget::new();
+        assert!(!budget.record::<std::convert::Infallible>(Ok(failure(false))));
+        assert!(budget.exhausted());
+        assert!(!budget.offered);
+
+        // Success wins over the counters.
+        let mut budget = PublickeyBudget::new();
+        assert!(budget.record::<std::convert::Infallible>(Ok(client::AuthResult::Success)));
     }
 }
