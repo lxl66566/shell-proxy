@@ -345,24 +345,73 @@ pub fn encode_event_frame(frame: &EventFrame) -> Result<Vec<u8>> {
 }
 
 fn encode_raw(kind: u8, payload: &[u8]) -> Result<Vec<u8>> {
-    let len = u32::try_from(payload.len())
-        .map_err(|_| Error::Protocol(format!("frame too large: {}", payload.len())))?;
+    let hdr = frame_header(kind, payload.len())?;
     let mut buf = Vec::with_capacity(5 + payload.len());
-    buf.push(kind);
-    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&hdr);
     buf.extend_from_slice(payload);
     Ok(buf)
 }
 
+/// Header for one frame: `[kind][u32 LE len]`.
+fn frame_header(kind: u8, len: usize) -> Result<[u8; 5]> {
+    let len = u32::try_from(len).map_err(|_| Error::Protocol(format!("frame too large: {len}")))?;
+    let mut hdr = [0u8; 5];
+    hdr[0] = kind;
+    hdr[1..5].copy_from_slice(&len.to_le_bytes());
+    Ok(hdr)
+}
+
+/// Raw payloads below this size are packed into one contiguous buffer; copying
+/// a few KiB costs less than the second write syscall that a split write adds.
+/// Larger payloads are written as header + payload with no copy.
+const PACKED_PAYLOAD_MAX: usize = 8 * 1024;
+
 /// Write one initiator frame.
+///
+/// Large raw payloads ([`ExecFrame::StdinData`]) are written directly from
+/// `frame` as two writes (header, then payload) instead of being copied into
+/// one buffer. This requires an exclusive writer per stream: the two writes
+/// must not interleave with another frame's. Every write path of this
+/// protocol is an exclusive task by design.
 pub async fn write_exec_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &ExecFrame) -> Result<()> {
-    w.write_all(&encode_exec_frame(frame)?).await?;
-    Ok(())
+    match frame {
+        ExecFrame::StdinData(d) if d.len() >= PACKED_PAYLOAD_MAX => {
+            write_raw(w, ExecKind::StdinData as u8, d).await
+        },
+        _ => {
+            w.write_all(&encode_exec_frame(frame)?).await?;
+            Ok(())
+        },
+    }
 }
 
 /// Write one responder frame.
+///
+/// Large raw payloads ([`EventFrame::Stdout`], [`EventFrame::Stderr`]) are
+/// written directly from `frame` as two writes (header, then payload) instead
+/// of being copied into one buffer. This requires an exclusive writer per
+/// stream: the two writes must not interleave with another frame's. Every
+/// write path of this protocol is an exclusive task by design.
 pub async fn write_event_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &EventFrame) -> Result<()> {
-    w.write_all(&encode_event_frame(frame)?).await?;
+    match frame {
+        EventFrame::Stdout(d) if d.len() >= PACKED_PAYLOAD_MAX => {
+            write_raw(w, EventKind::Stdout as u8, d).await
+        },
+        EventFrame::Stderr(d) if d.len() >= PACKED_PAYLOAD_MAX => {
+            write_raw(w, EventKind::Stderr as u8, d).await
+        },
+        _ => {
+            w.write_all(&encode_event_frame(frame)?).await?;
+            Ok(())
+        },
+    }
+}
+
+/// Copy-free frame write: header and payload as two writes.
+async fn write_raw<W: AsyncWrite + Unpin>(w: &mut W, kind: u8, payload: &[u8]) -> Result<()> {
+    let hdr = frame_header(kind, payload.len())?;
+    w.write_all(&hdr).await?;
+    w.write_all(payload).await?;
     Ok(())
 }
 
@@ -463,6 +512,35 @@ mod tests {
         let too_large = u32::try_from(MAX_PAYLOAD).unwrap() + 1;
         hdr.extend_from_slice(&too_large.to_le_bytes());
         assert!(dec.push(&hdr).is_err());
+    }
+
+    #[tokio::test]
+    async fn large_payloads_take_the_split_write_path() {
+        // Above the threshold: written as header + payload writes, yet the
+        // wire bytes must equal the packed encoding.
+        let payload: Vec<u8> = (0..=PACKED_PAYLOAD_MAX)
+            .map(|i| u8::try_from(i % 251).expect("fits in u8"))
+            .collect();
+
+        let ev = EventFrame::Stdout(payload.clone());
+        let mut buf = Vec::new();
+        write_event_frame(&mut buf, &ev).await.unwrap();
+        assert_eq!(buf, encode_event_frame(&ev).unwrap());
+        let mut cur = std::io::Cursor::new(&buf);
+        match read_event_frame(&mut cur).await.unwrap().unwrap() {
+            EventFrame::Stdout(d) => assert_eq!(d, payload),
+            _ => panic!("wrong frame"),
+        }
+
+        let ex = ExecFrame::StdinData(payload);
+        let mut buf = Vec::new();
+        write_exec_frame(&mut buf, &ex).await.unwrap();
+        assert_eq!(buf, encode_exec_frame(&ex).unwrap());
+        let mut cur = std::io::Cursor::new(&buf);
+        match read_exec_frame(&mut cur).await.unwrap().unwrap() {
+            ExecFrame::StdinData(d) => assert_eq!(d.len(), PACKED_PAYLOAD_MAX + 1),
+            _ => panic!("wrong frame"),
+        }
     }
 
     #[test]
