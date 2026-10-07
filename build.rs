@@ -2,9 +2,10 @@
 //!
 //! Source resolution per target, first hit wins:
 //! 1. env var `SP_SERVE_X86_64` / `SP_SERVE_AARCH64` (path to the binary);
-//! 2. `target/<triple>/release/sp-serve` in the workspace (cargo cross-built);
+//! 2. `<target dir>/<triple>/release/sp-serve`, where the target dir is `CARGO_TARGET_DIR` if set,
+//!    else `target/` under the package root (cargo cross-built);
 //! 3. empty placeholder: `sp` builds fine, but deploy fails with a clear error naming the env var
-//!    to set.
+//!    to set. A `cargo:warning` is emitted so the degraded embed is visible at build time already.
 
 use std::{env, path::PathBuf};
 
@@ -23,25 +24,39 @@ const TARGETS: [(&str, &str, &str); 2] = [
 
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
+    // Relative values resolve against the build script's cwd (package root),
+    // the same place the default `target/` lives.
+    let target_dir = env::var_os("CARGO_TARGET_DIR")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| PathBuf::from("target"), PathBuf::from);
     for (env_var, triple, out_name) in TARGETS {
         println!("cargo:rerun-if-env-changed={env_var}");
         // Watch the candidate path unconditionally: after a placeholder build,
         // a later cross-build dropping the binary there must re-run the embed.
         // (Emitting any rerun directive disables cargo's default
         // rebuild-on-any-change, so this must not depend on `src` being Some.)
-        let candidate = PathBuf::from(format!("target/{triple}/release/sp-serve"));
+        let candidate = target_dir.join(triple).join("release").join("sp-serve");
         println!("cargo:rerun-if-changed={}", candidate.display());
         let src = env::var_os(env_var)
             .map(PathBuf::from)
             .filter(|p| p.is_file())
-            .or_else(|| candidate.is_file().then_some(candidate));
+            .or_else(|| candidate.is_file().then(|| candidate.clone()));
         let dest = out_dir.join(out_name);
         match src {
             Some(p) => {
                 println!("cargo:rerun-if-changed={}", p.display());
                 std::fs::copy(&p, &dest).expect("copy sp-serve binary");
             },
-            None => std::fs::write(&dest, []).expect("write empty placeholder"),
+            None => {
+                println!(
+                    "cargo:warning={env_var} is not set and {} was not found; embedding an empty \
+                     placeholder. Remote deploy will fail until you cross-build sp-serve there or \
+                     point {env_var} at the binary",
+                    candidate.display()
+                );
+                std::fs::write(&dest, []).expect("write empty placeholder");
+            },
         }
     }
 }
