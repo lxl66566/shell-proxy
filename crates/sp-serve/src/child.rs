@@ -61,13 +61,21 @@ pub fn spawn(req: &ExecRequest) -> io::Result<Spawned> {
 
     // memfd: anonymous in-memory files, no filesystem leftovers. CLOEXEC is
     // cleared for the child in pre_exec. The restore memfd is empty content
-    // when no state exists - the wrapper's eval of "" is a no-op.
-    let rc_file = memfd(c"sp-rcfile", wrapper::rc_body(err_fd).as_bytes())?;
-    let cmd_file = memfd(c"sp-cmd", req.command.as_bytes())?;
-    let state_file = memfd(c"sp-state", req.state.as_deref().unwrap_or("").as_bytes())?;
+    // when no state exists - the wrapper's eval of "" is a no-op. The rcfile
+    // body references its own fd (it closes it after sourcing), so that memfd
+    // is created empty and filled once the fd number is known.
+    let mut rc_file = memfd(c"sp-rcfile")?;
     let rc_fd = rc_file.as_raw_fd();
+    fill(&mut rc_file, wrapper::rc_body(rc_fd, err_fd).as_bytes())?;
+    let mut cmd_file = memfd(c"sp-cmd")?;
     let cmd_fd = cmd_file.as_raw_fd();
+    fill(&mut cmd_file, req.command.as_bytes())?;
+    let mut state_file = memfd(c"sp-state")?;
     let restore_fd = state_file.as_raw_fd();
+    fill(
+        &mut state_file,
+        req.state.as_deref().unwrap_or("").as_bytes(),
+    )?;
 
     let mut cmd = Command::new("bash");
     cmd.arg("--noprofile")
@@ -149,16 +157,20 @@ pub fn spawn(req: &ExecRequest) -> io::Result<Spawned> {
     })
 }
 
-/// Create an in-memory file with `content`, rewound for reading.
-fn memfd(name: &CStr, content: &[u8]) -> io::Result<std::fs::File> {
+/// Create an empty in-memory file.
+fn memfd(name: &CStr) -> io::Result<std::fs::File> {
     // SAFETY: plain syscall; the returned fd is owned by us.
     let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `fd` is a fresh, uniquely owned descriptor.
-    let mut file = unsafe { <std::fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(fd) };
+    unsafe { Ok(<std::fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(fd)) }
+}
+
+/// Fill a memfd with `content`, rewound for reading.
+fn fill(file: &mut std::fs::File, content: &[u8]) -> io::Result<()> {
     file.write_all(content)?;
     file.seek(SeekFrom::Start(0))?;
-    Ok(file)
+    Ok(())
 }
