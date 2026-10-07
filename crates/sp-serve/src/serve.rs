@@ -258,6 +258,10 @@ async fn execute(
     let mut wait = std::pin::pin!(child.wait());
     let mut timed_out = false;
     let mut ctrl_open = true;
+    // A writer that dies without observing a send failure (panic, abort)
+    // leaves the oneshot permanently Ready(Err); the flag keeps the select
+    // from spinning on it for the rest of the run.
+    let mut dead_done = false;
 
     let status = loop {
         let sel = tokio::select! {
@@ -271,7 +275,7 @@ async fn execute(
                     None => std::future::pending().await,
                 }
             }, if kill_deadline.is_some() || term_deadline.is_some() => Sel::Timeout,
-            d = &mut dead_rx => Sel::Dead(d.is_ok()),
+            d = &mut dead_rx, if !dead_done => Sel::Dead(d.is_ok()),
         };
         match sel {
             Sel::Ctrl(Some(Ctrl::Signal(s))) => {
@@ -323,6 +327,7 @@ async fn execute(
                 }
             },
             Sel::Dead(d) => {
+                dead_done = true;
                 if d {
                     kill_group_raw(pgid, libc::SIGKILL);
                     bail!("daemon vanished while the command was running");
