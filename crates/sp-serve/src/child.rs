@@ -56,7 +56,7 @@ pub fn spawn(req: &ExecRequest) -> io::Result<Spawned> {
     let in_fd = stdin_r.as_raw_fd();
     let out_fd = stdout_w.as_raw_fd();
     let err_fd = stderr_w.as_raw_fd();
-    let cwd_fd = cwd_w.as_raw_fd();
+    let pwd_fd = cwd_w.as_raw_fd();
     let dump_fd = state_w.as_raw_fd();
 
     // memfd: anonymous in-memory files, no filesystem leftovers. CLOEXEC is
@@ -83,7 +83,7 @@ pub fn spawn(req: &ExecRequest) -> io::Result<Spawned> {
         .arg(format!("/dev/fd/{rc_fd}"))
         .arg("-i")
         .arg("-c")
-        .arg(wrapper::wrapper_body(cmd_fd, restore_fd, dump_fd, cwd_fd))
+        .arg(wrapper::wrapper_body(cmd_fd, restore_fd, dump_fd, pwd_fd))
         // $0 named bash so error messages match a plain bash session.
         .arg("bash")
         .args(&req.args);
@@ -115,7 +115,7 @@ pub fn spawn(req: &ExecRequest) -> io::Result<Spawned> {
             if libc::dup2(out_fd, 1) < 0 {
                 return Err(io::Error::last_os_error());
             }
-            for fd in [in_fd, out_fd, err_fd, cwd_fd, dump_fd] {
+            for fd in [in_fd, out_fd, err_fd, pwd_fd, dump_fd] {
                 let flags = libc::fcntl(fd, libc::F_GETFL);
                 if flags < 0 {
                     return Err(io::Error::last_os_error());
@@ -126,7 +126,7 @@ pub fn spawn(req: &ExecRequest) -> io::Result<Spawned> {
             }
             // Let the rcfile/command/state memfds and the stderr/cwd/state
             // pipes survive exec.
-            for fd in [rc_fd, cmd_fd, restore_fd, err_fd, cwd_fd, dump_fd] {
+            for fd in [rc_fd, cmd_fd, restore_fd, err_fd, pwd_fd, dump_fd] {
                 if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }

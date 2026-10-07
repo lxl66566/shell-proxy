@@ -355,7 +355,7 @@ async fn execute(
     // before the writer task can observe channel closure.
     route.abort();
 
-    let code = status_code(&status);
+    let code = status_code(status);
     // Drain tail output. Orphaned jobs holding the pipes open must not block
     // us: once output stops making progress the pumps are aborted, not
     // merely detached - a detached pump keeps its writer sender alive, so
@@ -609,7 +609,7 @@ fn kill_group_raw(pgid: i32, sig: i32) {
 }
 
 /// Exit code from a wait status: normal code, or 128+signum like a shell.
-fn status_code(status: &std::process::ExitStatus) -> i32 {
+fn status_code(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     if let Some(c) = status.code() {
         return c;
