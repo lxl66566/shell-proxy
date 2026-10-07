@@ -7,8 +7,7 @@
 //! stream payloads are raw bytes. [`ExecFrame`] flows from the initiator,
 //! [`EventFrame`] flows back.
 
-use std::io::ErrorKind;
-
+use bytes::{Buf, BytesMut};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -210,11 +209,17 @@ pub enum EventFrame {
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
 /// Read one initiator frame from a stream; `None` on clean EOF.
+///
+/// EOF is clean only at a frame boundary; a connection closed inside a header
+/// or payload surfaces as [`Error::Protocol`] instead of a bare io EOF, so a
+/// peer dying mid-frame is not mistaken for a normal shutdown.
 pub async fn read_exec_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<ExecFrame>> {
     read_frame_as(r, ExecKind::try_from, decode_exec).await
 }
 
 /// Read one responder frame from a stream; `None` on clean EOF.
+///
+/// See [`read_exec_frame`] for the mid-frame EOF semantics.
 pub async fn read_event_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<EventFrame>> {
     read_frame_as(r, EventKind::try_from, decode_event).await
 }
@@ -228,27 +233,53 @@ where
     R: AsyncRead + Unpin,
     F: Fn(u8) -> Result<K>,
 {
+    // Byte-counted header read: only zero bytes at the frame start is a clean
+    // EOF. read_exact would collapse a 4-of-5-byte header into the same
+    // UnexpectedEof, silently losing a truncated frame.
     let mut hdr = [0u8; 5];
-    match r.read_exact(&mut hdr).await {
-        Ok(_) => {},
-        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+    let mut filled = 0;
+    while filled < 5 {
+        let n = r.read(&mut hdr[filled..]).await?;
+        if n == 0 {
+            if filled == 0 {
+                return Ok(None);
+            }
+            return Err(Error::Protocol(format!(
+                "connection closed mid-frame: partial header ({filled}/5 bytes)"
+            )));
+        }
+        filled += n;
     }
     let kind = kind_of(hdr[0])?;
     let len = u32::from_le_bytes(hdr[1..5].try_into().expect("4 bytes")) as usize;
     if len > MAX_PAYLOAD {
         return Err(Error::Protocol(format!("frame too large: {len}")));
     }
-    let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload).await?;
+    let mut payload = Vec::with_capacity(len);
+    while payload.len() < len {
+        // read_buf fills the reserved capacity directly: no zero-init pass.
+        let n = r.read_buf(&mut payload).await?;
+        if n == 0 {
+            return Err(Error::Protocol(format!(
+                "connection closed mid-frame: partial payload ({}/{len} bytes)",
+                payload.len()
+            )));
+        }
+    }
     decode(kind, payload).map(Some)
 }
+
+/// Buffer capacity kept across pushes once fully consumed; anything larger
+/// (a max-size frame passed through) is released. Comfortably above the
+/// ~32 KiB chunks the SSH hop delivers, so steady-state decoding never
+/// re-allocates.
+const KEEP_CAPACITY: usize = 256 * 1024;
 
 /// Incremental decoder for a responder frame stream arriving as byte chunks
 /// (SSH channel data). Feed chunks with [`EventDecoder::push`].
 #[derive(Default)]
 pub struct EventDecoder {
-    buf: Vec<u8>,
+    buf: BytesMut,
 }
 
 impl EventDecoder {
@@ -274,8 +305,12 @@ impl EventDecoder {
             }
             let kind = EventKind::try_from(self.buf[0])?;
             let payload = self.buf[5..5 + len].to_vec();
-            self.buf.drain(..5 + len);
+            // advance consumes in O(1); drain would memmove the remainder.
+            self.buf.advance(5 + len);
             out.push(decode_event(kind, payload)?);
+        }
+        if self.buf.is_empty() && self.buf.capacity() > KEEP_CAPACITY {
+            self.buf = BytesMut::new();
         }
         Ok(out)
     }
@@ -328,24 +363,73 @@ pub fn encode_event_frame(frame: &EventFrame) -> Result<Vec<u8>> {
 }
 
 fn encode_raw(kind: u8, payload: &[u8]) -> Result<Vec<u8>> {
-    let len = u32::try_from(payload.len())
-        .map_err(|_| Error::Protocol(format!("frame too large: {}", payload.len())))?;
+    let hdr = frame_header(kind, payload.len())?;
     let mut buf = Vec::with_capacity(5 + payload.len());
-    buf.push(kind);
-    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&hdr);
     buf.extend_from_slice(payload);
     Ok(buf)
 }
 
+/// Header for one frame: `[kind][u32 LE len]`.
+fn frame_header(kind: u8, len: usize) -> Result<[u8; 5]> {
+    let len = u32::try_from(len).map_err(|_| Error::Protocol(format!("frame too large: {len}")))?;
+    let mut hdr = [0u8; 5];
+    hdr[0] = kind;
+    hdr[1..5].copy_from_slice(&len.to_le_bytes());
+    Ok(hdr)
+}
+
+/// Raw payloads below this size are packed into one contiguous buffer; copying
+/// a few KiB costs less than the second write syscall that a split write adds.
+/// Larger payloads are written as header + payload with no copy.
+const PACKED_PAYLOAD_MAX: usize = 8 * 1024;
+
 /// Write one initiator frame.
+///
+/// Large raw payloads ([`ExecFrame::StdinData`]) are written directly from
+/// `frame` as two writes (header, then payload) instead of being copied into
+/// one buffer. This requires an exclusive writer per stream: the two writes
+/// must not interleave with another frame's. Every write path of this
+/// protocol is an exclusive task by design.
 pub async fn write_exec_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &ExecFrame) -> Result<()> {
-    w.write_all(&encode_exec_frame(frame)?).await?;
-    Ok(())
+    match frame {
+        ExecFrame::StdinData(d) if d.len() >= PACKED_PAYLOAD_MAX => {
+            write_raw(w, ExecKind::StdinData as u8, d).await
+        },
+        _ => {
+            w.write_all(&encode_exec_frame(frame)?).await?;
+            Ok(())
+        },
+    }
 }
 
 /// Write one responder frame.
+///
+/// Large raw payloads ([`EventFrame::Stdout`], [`EventFrame::Stderr`]) are
+/// written directly from `frame` as two writes (header, then payload) instead
+/// of being copied into one buffer. This requires an exclusive writer per
+/// stream: the two writes must not interleave with another frame's. Every
+/// write path of this protocol is an exclusive task by design.
 pub async fn write_event_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &EventFrame) -> Result<()> {
-    w.write_all(&encode_event_frame(frame)?).await?;
+    match frame {
+        EventFrame::Stdout(d) if d.len() >= PACKED_PAYLOAD_MAX => {
+            write_raw(w, EventKind::Stdout as u8, d).await
+        },
+        EventFrame::Stderr(d) if d.len() >= PACKED_PAYLOAD_MAX => {
+            write_raw(w, EventKind::Stderr as u8, d).await
+        },
+        _ => {
+            w.write_all(&encode_event_frame(frame)?).await?;
+            Ok(())
+        },
+    }
+}
+
+/// Copy-free frame write: header and payload as two writes.
+async fn write_raw<W: AsyncWrite + Unpin>(w: &mut W, kind: u8, payload: &[u8]) -> Result<()> {
+    let hdr = frame_header(kind, payload.len())?;
+    w.write_all(&hdr).await?;
+    w.write_all(payload).await?;
     Ok(())
 }
 
@@ -446,6 +530,59 @@ mod tests {
         let too_large = u32::try_from(MAX_PAYLOAD).unwrap() + 1;
         hdr.extend_from_slice(&too_large.to_le_bytes());
         assert!(dec.push(&hdr).is_err());
+    }
+
+    #[tokio::test]
+    async fn eof_mid_frame_is_a_protocol_error_not_clean_eof() {
+        let wire = encode_event_frame(&EventFrame::Stdout(vec![7; 10])).unwrap();
+
+        // EOF before any header byte: clean end of stream.
+        let mut cur = std::io::Cursor::new(Vec::new());
+        assert!(read_event_frame(&mut cur).await.unwrap().is_none());
+
+        // Truncation at every point inside the frame must be a protocol error
+        // naming the mid-frame close, never a clean EOF or a bare io error.
+        for take in 1..wire.len() {
+            let mut cur = std::io::Cursor::new(&wire[..take]);
+            match read_event_frame(&mut cur).await {
+                Err(Error::Protocol(msg)) => assert!(msg.contains("mid-frame"), "{msg}"),
+                other => panic!("expected protocol error at {take} bytes, got {other:?}"),
+            }
+        }
+
+        // Full frame then EOF stays clean.
+        let mut cur = std::io::Cursor::new(&wire);
+        assert!(read_event_frame(&mut cur).await.unwrap().is_some());
+        assert!(read_event_frame(&mut cur).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn large_payloads_take_the_split_write_path() {
+        // Above the threshold: written as header + payload writes, yet the
+        // wire bytes must equal the packed encoding.
+        let payload: Vec<u8> = (0..=PACKED_PAYLOAD_MAX)
+            .map(|i| u8::try_from(i % 251).expect("fits in u8"))
+            .collect();
+
+        let ev = EventFrame::Stdout(payload.clone());
+        let mut buf = Vec::new();
+        write_event_frame(&mut buf, &ev).await.unwrap();
+        assert_eq!(buf, encode_event_frame(&ev).unwrap());
+        let mut cur = std::io::Cursor::new(&buf);
+        match read_event_frame(&mut cur).await.unwrap().unwrap() {
+            EventFrame::Stdout(d) => assert_eq!(d, payload),
+            _ => panic!("wrong frame"),
+        }
+
+        let ex = ExecFrame::StdinData(payload);
+        let mut buf = Vec::new();
+        write_exec_frame(&mut buf, &ex).await.unwrap();
+        assert_eq!(buf, encode_exec_frame(&ex).unwrap());
+        let mut cur = std::io::Cursor::new(&buf);
+        match read_exec_frame(&mut cur).await.unwrap().unwrap() {
+            ExecFrame::StdinData(d) => assert_eq!(d.len(), PACKED_PAYLOAD_MAX + 1),
+            _ => panic!("wrong frame"),
+        }
     }
 
     #[test]
