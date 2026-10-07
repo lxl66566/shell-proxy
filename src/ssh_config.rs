@@ -36,7 +36,7 @@ pub struct ResolvedHost {
 
 /// Resolve `host` by running `ssh -G host` and parsing the key/value output.
 ///
-/// Falls back to direct connection parameters when the ssh binary is unusable.
+/// Fails when `ssh -G` is unusable and the local user cannot be determined.
 pub async fn resolve(host: &str) -> Result<ResolvedHost> {
     match run_ssh_g(host).await {
         Ok(r) => Ok(r),
@@ -44,17 +44,26 @@ pub async fn resolve(host: &str) -> Result<ResolvedHost> {
             // Masking this would surface as a confusing "connect to <alias>
             // failed" later; the reason belongs in the daemon log.
             warn!("ssh -G failed, falling back to a direct connection: {e}");
-            Ok(fallback(host))
+            fallback(host)
         },
     }
 }
 
-/// Direct connection fallback used when `ssh -G` cannot run at all.
-fn fallback(host: &str) -> ResolvedHost {
-    let user = std::env::var("USER")
+/// Local username (ssh `%u`); None when the environment has neither USER nor
+/// USERNAME.
+fn local_user() -> Option<String> {
+    std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "root".into());
-    ResolvedHost {
+        .ok()
+}
+
+/// Direct connection fallback used when `ssh -G` cannot run at all.
+fn fallback(host: &str) -> Result<ResolvedHost> {
+    let user = local_user().ok_or_else(|| Error::Resolve {
+        host: host.to_owned(),
+        reason: "cannot determine the local user: neither USER nor USERNAME is set".into(),
+    })?;
+    Ok(ResolvedHost {
         hostname: host.to_owned(),
         port: 22,
         user,
@@ -64,14 +73,20 @@ fn fallback(host: &str) -> ResolvedHost {
         connect_timeout: None,
         strict_host_keys: true,
         host_key_alias: None,
-    }
+    })
 }
 
 fn default_identity_files() -> Vec<PathBuf> {
-    ["id_ed25519", "id_ecdsa", "id_rsa"]
-        .into_iter()
-        .map(|n| home_ssh().join(n))
-        .collect()
+    [
+        "id_ed25519",
+        "id_ecdsa",
+        "id_rsa",
+        "id_ed25519_sk",
+        "id_ecdsa_sk",
+    ]
+    .into_iter()
+    .map(|n| home_ssh().join(n))
+    .collect()
 }
 
 fn home_ssh() -> PathBuf {
@@ -132,7 +147,7 @@ fn parse_ssh_g_output(host: &str, text: &str) -> Result<ResolvedHost> {
             "user" => user = Some(unquote(value)),
             // 0 means "system default" in ssh, which we map to our own default
             "connecttimeout" => {
-                connect_timeout = value
+                connect_timeout = unquote(value)
                     .parse()
                     .ok()
                     .filter(|secs: &u64| *secs > 0)
@@ -185,18 +200,22 @@ fn parse_ssh_g_output(host: &str, text: &str) -> Result<ResolvedHost> {
         reason: "ssh -G output has no hostname".into(),
     })?;
 
-    // ProxyJump is materialized by OpenSSH into a ProxyCommand; build one ourselves
-    // in case only the jump field is set.
-    let proxy_command = proxy_command
-        .or_else(|| proxy_jump.map(|jump| format!("ssh -W [{hostname}]:{port} {jump}")));
+    // ssh resolves the user itself when the config sets none; the local user
+    // is the fallback, and a missing one is an error rather than a guess.
+    let user = user.or_else(local_user).ok_or_else(|| Error::Resolve {
+        host: host.to_owned(),
+        reason: "ssh -G output has no user and neither USER nor USERNAME is set".into(),
+    })?;
 
-    let user = user
-        .or_else(|| {
-            std::env::var("USER")
-                .or_else(|_| std::env::var("USERNAME"))
-                .ok()
+    // ProxyJump is materialized by OpenSSH into a ProxyCommand; build one ourselves
+    // in case only the jump field is set. Tokens in the jump spec are expanded
+    // with the target's hostname/port/user, like OpenSSH does.
+    let proxy_command = proxy_command.or_else(|| {
+        proxy_jump.map(|jump| {
+            let jump = expand_tokens(&jump, &hostname, port, &user, local_user().as_deref());
+            format!("ssh -W [{hostname}]:{port} {jump}")
         })
-        .unwrap_or_else(|| "root".into());
+    });
 
     if identity_files.is_empty() {
         identity_files = default_identity_files();
@@ -218,12 +237,50 @@ fn parse_ssh_g_output(host: &str, text: &str) -> Result<ResolvedHost> {
     })
 }
 
-/// Expand %h/%p/%n tokens in a ProxyCommand.
+/// Expand ProxyCommand tokens in a single left-to-right pass: `%%`, `%h`,
+/// `%n`, `%p`, `%r`, `%u`. Tokens sp cannot expand (`%C`, `%d`, `%f`, ...) are
+/// left verbatim for the command to interpret.
+fn expand_tokens(
+    cmd: &str,
+    hostname: &str,
+    port: u16,
+    user: &str,
+    local_user: Option<&str>,
+) -> String {
+    // %n is the pre-canonicalization hostname, which sp does not keep; the
+    // resolved hostname is the closest equivalent.
+    let mut out = String::with_capacity(cmd.len());
+    let mut chars = cmd.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            // Trailing or doubled percent: a literal percent.
+            Some('%') | None => out.push('%'),
+            Some('h' | 'n') => out.push_str(hostname),
+            Some('p') => out.push_str(&port.to_string()),
+            Some('r') => out.push_str(user),
+            // %u is the local username; kept verbatim when it is unknown.
+            Some('u') => match local_user {
+                Some(u) => out.push_str(u),
+                None => out.push_str("%u"),
+            },
+            // Unknown token: keep verbatim.
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            },
+        }
+    }
+    out
+}
+
+/// Expand %h/%p/%n/%r/%u tokens in a ProxyCommand.
 #[must_use]
-pub fn expand_proxy_command(cmd: &str, hostname: &str, port: u16) -> String {
-    cmd.replace("%h", hostname)
-        .replace("%p", &port.to_string())
-        .replace("%n", hostname)
+pub fn expand_proxy_command(cmd: &str, hostname: &str, port: u16, user: &str) -> String {
+    expand_tokens(cmd, hostname, port, user, local_user().as_deref())
 }
 
 /// Expand a leading `~` to the user's home directory (`ssh -G` emits `~/...`).
@@ -329,6 +386,13 @@ identityfile \"C:/a b/id_ed25519\"
             parse_ssh_g_output("x", &mk("10")).unwrap().connect_timeout,
             Some(Duration::from_secs(10))
         );
+        // Quoted values are unquoted before parsing.
+        assert_eq!(
+            parse_ssh_g_output("x", &mk("\"10\""))
+                .unwrap()
+                .connect_timeout,
+            Some(Duration::from_secs(10))
+        );
         // 0 = system default in ssh, mapped to our own default
         assert_eq!(
             parse_ssh_g_output("x", &mk("0")).unwrap().connect_timeout,
@@ -343,9 +407,66 @@ identityfile \"C:/a b/id_ed25519\"
     }
 
     #[test]
-    fn expand_tokens() {
+    fn parse_hostkeyalias() {
+        let mk = |v: &str| format!("host x\nhostname h\nhostkeyalias {v}\n");
         assert_eq!(
-            expand_proxy_command("connect -H 1 %h %p", "h1", 22),
+            parse_ssh_g_output("x", &mk("myalias"))
+                .unwrap()
+                .host_key_alias,
+            Some("myalias".into())
+        );
+        assert_eq!(
+            parse_ssh_g_output("x", &mk("NONE")).unwrap().host_key_alias,
+            None
+        );
+        assert_eq!(
+            parse_ssh_g_output("x", &mk("none")).unwrap().host_key_alias,
+            None
+        );
+    }
+
+    #[test]
+    fn default_identities_include_security_keys() {
+        let files = default_identity_files();
+        assert!(files.iter().any(|p| p.ends_with("id_ed25519_sk")));
+        assert!(files.iter().any(|p| p.ends_with("id_ecdsa_sk")));
+    }
+
+    #[test]
+    fn proxyjump_tokens_expand() {
+        let text = "\
+host j
+hostname ex.org
+port 2200
+user u1
+proxyjump u2@jump%h:2222
+";
+        let r = parse_ssh_g_output("j", text).unwrap();
+        assert_eq!(
+            r.proxy_command.as_deref(),
+            Some("ssh -W [ex.org]:2200 u2@jumpex.org:2222")
+        );
+    }
+
+    #[test]
+    fn expand_proxy_command_tokens() {
+        assert_eq!(
+            expand_tokens("nc %h %p %%", "h1", 22, "r1", Some("lu")),
+            "nc h1 22 %"
+        );
+        assert_eq!(
+            expand_tokens("ssh -l %r -o User=%u %n:%p", "h1", 2200, "r1", Some("lu")),
+            "ssh -l r1 -o User=lu h1:2200"
+        );
+        // %u stays verbatim when the local user is unknown; unknown tokens
+        // and a trailing percent are preserved.
+        assert_eq!(expand_tokens("x %u %d %", "h", 22, "r", None), "x %u %d %");
+    }
+
+    #[test]
+    fn expand_proxy_command_basic() {
+        assert_eq!(
+            expand_proxy_command("connect -H 1 %h %p", "h1", 22, "u"),
             "connect -H 1 h1 22"
         );
     }

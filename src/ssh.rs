@@ -514,7 +514,7 @@ pub async fn connect(resolved: ResolvedHost) -> Result<SshConnection> {
 
     let mut proxy_child = None;
     let mut handle = if let Some(pc) = resolved.proxy_command.as_deref() {
-        let cmd = expand_proxy_command(pc, &resolved.hostname, resolved.port);
+        let cmd = expand_proxy_command(pc, &resolved.hostname, resolved.port, &resolved.user);
         let (stream, mut child) =
             spawn_proxy(&cmd).map_err(|e| Error::Connect(format!("proxycommand {cmd:?}: {e}")))?;
         setup_deadline = Instant::now() + setup_timeout;
