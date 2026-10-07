@@ -25,10 +25,12 @@ use crate::child::{self, Spawned};
 /// Give the daemon this long to send the Exec frame before giving up.
 const EXEC_WAIT: Duration = Duration::from_secs(30);
 
-/// How long to keep draining child pipes after the exit status, so tail bytes
-/// are not lost. A job surviving the command (`nohup ... &`) inherits the
-/// pipes and never EOFs; past the grace the pumps are aborted and any further
-/// output is dropped.
+/// How long the drain phase may make no output progress before the pumps
+/// are aborted. Progress is measured at the writer: every frame pushed out
+/// resets the deadline, so a slow but consuming chain (full SSH window,
+/// slow client pipe) is never cut; only output stalled for the whole grace
+/// (a job surviving the command (`nohup ... &`) holding the pipes with
+/// nothing to send) is dropped.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Grace between the timeout TERM and the escalating KILL, so remote cleanup
@@ -119,8 +121,11 @@ async fn execute(
         .try_into()
         .context("pid does not fit i32")?;
 
-    // Single stdout writer keeps frames ordered.
+    // Single stdout writer keeps frames ordered. It also emits a progress
+    // tick per written frame, which backs the no-progress deadline of the
+    // drain phase (see [`drain_pumps`]).
     let (out_tx, mut out_rx) = mpsc::channel::<EventFrame>(256);
+    let (progress_tx, mut progress_rx) = tokio::sync::watch::channel(0u64);
     let (dead_tx, dead_rx) = tokio::sync::oneshot::channel::<()>();
     let writer = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
@@ -130,6 +135,7 @@ async fn execute(
             {
                 break;
             }
+            progress_tx.send_modify(|n| *n += 1);
         }
         // Daemon gone: output can no longer be delivered.
         let _ = dead_tx.send(());
@@ -339,18 +345,12 @@ async fn execute(
 
     let code = status_code(&status);
     // Drain tail output. Orphaned jobs holding the pipes open must not block
-    // us: past the grace the pumps are aborted, not merely detached - a
-    // detached pump keeps its writer sender alive, so the writer (and the Exit
-    // frame behind it) would wait on a channel that cannot close until the
-    // last orphan exits.
-    if tokio::time::timeout(DRAIN_GRACE, async {
-        let _ = (&mut out_pump).await;
-        let _ = (&mut err_pump).await;
-    })
-    .await
-    .is_err()
-    {
-        log("drain grace elapsed with output pipes still open (orphan job?); dropping tail");
+    // us: once output stops making progress the pumps are aborted, not
+    // merely detached - a detached pump keeps its writer sender alive, so
+    // the writer (and the Exit frame behind it) would wait on a channel
+    // that cannot close until the last orphan exits.
+    if !drain_pumps(&mut out_pump, &mut err_pump, &mut progress_rx).await {
+        log("output made no progress for the drain grace (orphan job?); dropping tail");
         out_pump.abort();
         err_pump.abort();
     }
@@ -527,6 +527,50 @@ where
             }
         }
     })
+}
+
+/// Wait for both output pumps to finish under a no-progress deadline.
+///
+/// Returns `true` when both finished. Every frame the writer flushes resets
+/// the [`DRAIN_GRACE`] deadline, so a slow but consuming chain never runs it
+/// out; only output that stays stalled for the whole grace - an orphan job
+/// holding the pipes open with nothing to send - is treated as undrainable.
+/// Losing the writer (its progress sender dropped) also returns `false`:
+/// nothing can consume the pumps anymore.
+async fn drain_pumps(
+    out_pump: &mut tokio::task::JoinHandle<()>,
+    err_pump: &mut tokio::task::JoinHandle<()>,
+    progress: &mut tokio::sync::watch::Receiver<u64>,
+) -> bool {
+    fn deadline() -> Option<Instant> {
+        Instant::now().checked_add(DRAIN_GRACE)
+    }
+    let mut out_done = false;
+    let mut err_done = false;
+    // The clock cannot represent the grace only at the very end of its
+    // range; treat that as stalled rather than waiting forever.
+    let Some(mut stop_at) = deadline() else {
+        return false;
+    };
+    loop {
+        if out_done && err_done {
+            return true;
+        }
+        tokio::select! {
+            _ = &mut *out_pump, if !out_done => out_done = true,
+            _ = &mut *err_pump, if !err_done => err_done = true,
+            changed = progress.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+                match deadline() {
+                    Some(d) => stop_at = d,
+                    None => return false,
+                }
+            },
+            () = tokio::time::sleep_until(stop_at) => return false,
+        }
+    }
 }
 
 /// Signal the whole process group of the child.
