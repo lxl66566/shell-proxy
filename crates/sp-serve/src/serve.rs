@@ -213,8 +213,9 @@ async fn execute(
                         pid: std::process::id(),
                     }));
                 },
-                // One exec per process; a second request is a protocol violation.
-                Ok(Some(ExecFrame::Exec(_))) => {},
+                // One exec per process; a second request is a protocol
+                // violation. It is ignored, but not silently.
+                Ok(Some(ExecFrame::Exec(_))) => log("ignoring a second Exec frame"),
                 Ok(None) => {
                     let _ = ctrl_tx.send(Ctrl::Closed).await;
                     break;
