@@ -25,7 +25,45 @@
 
 - 附带修复（非本清单项）：`4239085` 串行化 config 测试的环境变量变更（`SP_SESSION` 竞态在本轮验证中两次实际触发，属 CI 隐患）。
 - 关联影响说明：daemon 与内嵌 sp-serve 的信号带外路径为成对特性；若通过 `SP_SERVE_*` 环境变量覆盖部署旧版 serve 二进制，信号退回仅带内路径（window 打满时送达延迟，功能降级不损坏）——与 P2-5（无版本握手）同源，待 P2-5 一并解决。
-- 遗留验证（环境允许后执行）：`cargo test`（集成）覆盖——stdin 打满 + 超时不悬挂（P0-1 回归）、Ctrl+C / 超时后 cwd 与 state 保持（P1-3）、巨大 `--timeout` 拒绝（P1-1）、空 known_hosts 拒绝（P1-5）、TERM/HUP/KILL 转发。另：musl 目标存在 3 条存量 clippy lint（`child.rs` similar_names、`serve.rs` single_match_else / trivially_copy_pass_by_ref，均为审查基线已有、未触碰行）。
+- 遗留验证（环境允许后执行）：`cargo test`（集成）覆盖——stdin 打满 + 超时不悬挂（P0-1 回归）、Ctrl+C / 超时后 cwd 与 state 保持（P1-3）、巨大 `--timeout` 拒绝（P1-1）、空 known_hosts 拒绝（P1-5）、TERM/HUP/KILL 转发。另：musl 目标曾存在 3 条存量 clippy lint，已于 2026-10-08 清零（见下方「P2/P3 修复进度」附带项）。
+
+## P2/P3 修复进度（2026-10-08 更新）
+
+- 修复执行：GLM-5.3（manager 审查、指导、合并、提交）+ 3 个并发 subagent 按文件集互不相交分波实现（`crates/sp-serve` / `src/ssh.rs`+`src/ssh_config.rs` / `crates/sp-proto`+`build.rs`），保证提交原子性。
+- 验证方式：合并态 `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --lib`、`cargo test -p sp-serve --bins`、sp-serve 的 x86_64-unknown-linux-musl 交叉 clippy 全绿。约束与前两轮相同：未运行 sp、未连接远端、未跑 `tests/integration.rs`、未触碰运行中的 daemon 与用户配置。
+- manager 逐行复核范围：P2-9（安全语义 fail-closed）、P2-1/P2-2（serve 超时升级与 drain）、P2-4/P3-15（wrapper dump 逐字节兼容性与 fd 生命周期）。
+
+| 编号 | 状态 | 提交 | 修复要点 |
+|---|---|---|---|
+| P2-1 | 已修复 | `d954b61` | leader 在 TERM grace 内死亡时在 Exit break 后补发 `kill_group_raw(pgid, SIGKILL)`（以 kill_deadline 是否已武装判定升级尚未触发，避免重复 KILL；对已死组幂等），TERM 免疫同组成员不再作为孤儿存活 |
+| P2-2 | 已修复 | `0aa3703` | drain 上限改为「无进展超时」：writer 每写出一帧经 watch channel 发 progress tick 重置 2s deadline；慢消费链路（SSH window / 客户端管道积压）不再被固定 2s 截断，仅真正停滞（孤儿持管道无数据）才 abort。writer 消失与时钟溢出均按 stalled 处理 |
+| P2-4 | 已修复 | `dddd040` | errexit 在 `set +e` 前捕获，以 dump 子 shell 位置参数传递（`declare -p` 不 dump 位置参数，不泄漏进持久化状态）；erroff 时 dump 与旧版逐字节一致，errexit on 时仅在尾部追加 `set -o errexit`（尾部恢复避免 restore eval 中途被 errexit 打断） |
+| P2-5 | serve 侧已修复，daemon 侧待做 | `0d2d448` | `sp-serve --version` 与启动 stderr 各输出精确一行 `sp-serve <版本>`；daemon 首次部署后读回校验仍待实现（版本不匹配时报明确错误） |
+| P2-9 | 已修复 | `eeb7691` | 自实现 OpenSSH 兼容匹配：`match_pattern_list`（`*`/`?`/`!` 取反立即否决/逗号列表/大小写不敏感，迭代回溯）+ 非 22 端口 `[host]:port` 记录名 + `hostkeyalias` 优先查找 + `@revoked`（按 key 全行检查，后写优先，直接拒绝）+ `@cert-authority`（跳过不误匹配；strict 下证书呈现 fail closed，sp 不做 host 证书 CA 验证）；哈希（`|1|`）条目委托 russh 回退；错误信息区分 not found / changed / revoked / malformed；本机坏行 fail closed、他机坏行跳过；新增 17 个单测。strict 空 known_hosts 拒绝（P1-5）与已变更 key 硬失败语义不变 |
+| P2-10 | 已修复 | `341cb3a` | publickey 尝试上限 6（`PublickeyBudget`，agent 与 identity file 两路共享；russh agent 请求本身即无签名 probe，仍计入 MaxAuthTries）+ 按 `AuthResult::Failure { remaining_methods }` 不含 publickey 即停，不再耗尽服务端尝试次数 |
+| P3-2 | 已修复 | `730bbbd` | `EventDecoder` 内部改 `bytes::BytesMut`（advance O(1) 消费，缓冲清空且容量 >256KB 时收缩防单帧 16MB 后长期驻留）；`read_frame_as` 用 `Vec::with_capacity` + `read_buf` 消除零初始化 |
+| P3-3 | 已修复 | `81473f1` | write_exec/write_event_frame 对 ≥8KB 载荷走 header+payload 两次 `write_all` 零拷贝路径（前提：每流单写者任务，已在文档注释说明）；小载荷仍打包单写（小拷贝比多一次 syscall 便宜）；分写路径与打包编码有逐字节一致性测试 |
+| P3-4 | 已修复 | `99118e0` | header 读到 0 字节才算干净 EOF；部分 header / payload 中途断开映射为 `Protocol("connection closed mid-frame: ...")`，全截断点遍历测试锚定 |
+| P3-5 | 已修复 | `92c7cae` | `expand_tokens` 单遍展开 `%%` `%h` `%n`（以 resolved hostname 近似）`%p` `%r` `%u`，其余 token 原样；ProxyJump 串内同样展开；connecttimeout unquote；补 `id_ed25519_sk` / `id_ecdsa_sk`；本地用户名缺失由 fallback `root` 改为明确报错 |
+| P3-6 | 已修复 | `40c831f` | Windows `cmd /C` 插入命令串的 hostname/user 片段 `%` 翻倍转义，防 `%VAR%` 意外展开，跨平台测试 |
+| P3-7 | 已修复 | `1c6c4f4` | 用 russh `Handle::best_supported_rsa_hash` 协商（等 EXT_INFO 至多 1s）；无广播时走 Sha512 → Sha256 → ssh-rsa(SHA-1) 降级链，仅服务端拒绝（Failure）才降级，传输错误即停 |
+| P3-12 | 已修复 | `0a64e2a` | writer 死亡后 dead_done 标志消除 100% CPU 忙循环（仿 ctrl_open） |
+| P3-13 | 已修复 | `32ff6d1` | Pong 改 try_send，不再与 stdout 帧共用阻塞通道 |
+| P3-14 | 已修复 | `cf77d2e` | 第二个 Exec 帧 log warning，不再静默吞掉 |
+| P3-15 | 已修复 | `6f9f285` | rcfile memfd 由 rcfile 末尾自行关闭（child.rs 将 memfd 拆为 create+fill 两步使 rc body 能引用自身 fd）；restore fd 消费后立即关闭、cmd fd 读出后 eval 前关闭（命令文本短暂存于未导出 `__sp_cmd`，eval 后 unset）；SP_CWD 在 cd 后 unset，用户 `env` 不可见；P1-3 的 dump 内 unset 保持不变 |
+| P3-16 | 已修复 | `dcab767` | cwd/state 收集器区分 JoinError（任务 panic）与超时分支，不再把 panic 报成 "did not terminate in time" |
+| P3-17 | 已修复 | `0d62826` `8017f96` | build.rs 优先读 CARGO_TARGET_DIR（空值视为未设置，相对路径按 build script cwd 解析）+ `rerun-if-env-changed`；placeholder 时 `cargo:warning` 指明查找路径与修复方式；原有 rerun-if-changed 逻辑不变 |
+
+- 附带修复：`2446d00` 清零 musl 目标 3 条存量 clippy lint（`child.rs` similar_names、`serve.rs` single_match_else / trivially_copy_pass_by_ref），上文「遗留验证」中相关备注已失效。
+- 已知限制（实现注释中均有说明）：known_hosts 哈希条目仍委托 russh 匹配（自实现需新增 hmac/sha1 依赖，权衡后不做）；host 证书不做 CA 验证，strict 模式 fail closed 并给出明确理由；哈希条目上的 `@revoked` 无法由 russh 回退区分（`ssh-keygen -H` 从不哈希带 marker 的行，实际不存在该组合）。
+- 行为验证待环境允许后补集成测试锚点：errexit 持久化（P2-4）、超时 KILL 升级（P2-1，测试缺口 1）、known_hosts 通配符 / revoked / hostkeyalias（P2-9）。
+
+### 仍未实施（后续批次，2026-10-08 暂缓）
+
+- P2：P2-3（CLI 默认超时 + 排队提示）、P2-5 daemon 侧（部署后版本读回校验）、P2-6（deploy 与并发首连 race）、P2-7（daemon 自动拉起失败反馈）、P2-8（Windows 命名管道 DACL）、P2-11（MCP isError + cwd 回显）、P2-12（nextest 串行化失效）、P2-13（非 UTF-8 参数逐个报错）。
+- P3：P3-1（decoder.push 错误路径收尾）、P3-8（app_dir 副作用）、P3-9（req.clone 日志）、P3-10（日志按大小滚动）、P3-11（daemon config 解析失败 warn）、P3-18 至 P3-21（README 标注类）、P3-22（build_command 同步读 stdin）、P3-23（信号 try_send 日志与 unix 注册报错）、P3-24（host 逐出竞争）、P3-25（管道名清洗熵）。
+- MCP 能力面（专项分析三）：host 参数、二进制 read/write、interrupt、session 列表工具、push/pull 波浪号展开、cwd 回显（即 P2-11）。interactive 开关经评估倾向暂缓：rcfile 承担 stderr 恢复职责，无法简单旁路，需新增协议面收益边际。
+- 集成测试缺口清单（README「测试」一节的不一致、nextest 说明）与 README 不一致清单均未动。
 
 ## 总体架构与数据流
 
@@ -42,7 +80,7 @@ sp 分两级转发：本地 CLI / MCP 客户端通过命名管道（Windows）�
 | P2 | 13 | 边角场景的正确性问题、健壮性缺口、能力缺口 |
 | P3 | 25 | 优化建议、可观测性、文档一致性 |
 
-注：P0 与 P1 全部 8 项已于 2026-10-06 修复并入（见上方「P0/P1 修复进度」）；上表为审查时点快照，P2/P3 保持未动。
+注：P0 与 P1 全部 8 项已于 2026-10-06 修复并入（见「P0/P1 修复进度」）；P2 已修复 5 项、部分完成 1 项（P2-5 serve 侧），P3 已修复 12 项（见「P2/P3 修复进度」）；上表为审查时点快照。
 
 ---
 
