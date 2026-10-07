@@ -321,6 +321,18 @@ async fn execute(
         }
     };
 
+    // A leader that dies inside the TERM grace breaks the loop before the
+    // escalation branch fires; TERM-immune group members (`trap '' TERM`)
+    // would survive as orphans. Make up the skipped KILL (a no-op for a
+    // dead group), like `timeout -k`. An armed kill_deadline here means the
+    // escalation has not fired yet.
+    if kill_deadline.is_some() {
+        log(&format!(
+            "leader exited within the kill grace, sending KILL to pgid {pgid}"
+        ));
+        kill_group_raw(pgid, libc::SIGKILL);
+    }
+
     // The router holds an out_tx clone for Ping replies; it must be gone
     // before the writer task can observe channel closure.
     route.abort();
