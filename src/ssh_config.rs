@@ -29,6 +29,9 @@ pub struct ResolvedHost {
     /// `stricthostkeychecking` value: unknown keys are rejected unless this
     /// is `no`/`off`/`accept-new`.
     pub strict_host_keys: bool,
+    /// `hostkeyalias`: known_hosts entries are recorded under this name
+    /// instead of the hostname.
+    pub host_key_alias: Option<String>,
 }
 
 /// Resolve `host` by running `ssh -G host` and parsing the key/value output.
@@ -60,6 +63,7 @@ fn fallback(host: &str) -> ResolvedHost {
         proxy_command: None,
         connect_timeout: None,
         strict_host_keys: true,
+        host_key_alias: None,
     }
 }
 
@@ -114,6 +118,7 @@ fn parse_ssh_g_output(host: &str, text: &str) -> Result<ResolvedHost> {
     let mut proxy_command = None;
     let mut proxy_jump = None;
     let mut connect_timeout = None;
+    let mut host_key_alias = None;
 
     let mut strict_host_keys = true;
 
@@ -164,6 +169,13 @@ fn parse_ssh_g_output(host: &str, text: &str) -> Result<ResolvedHost> {
                     proxy_jump = Some(v);
                 }
             },
+            // `none` when unset; ssh -G lowercases the sentinel
+            "hostkeyalias" => {
+                let v = unquote(value);
+                if !v.eq_ignore_ascii_case("none") {
+                    host_key_alias = Some(v);
+                }
+            },
             _ => {},
         }
     }
@@ -202,6 +214,7 @@ fn parse_ssh_g_output(host: &str, text: &str) -> Result<ResolvedHost> {
         proxy_command,
         connect_timeout,
         strict_host_keys,
+        host_key_alias,
     })
 }
 
