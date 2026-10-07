@@ -369,14 +369,22 @@ async fn execute(
     let new_cwd = match tokio::time::timeout(DRAIN_GRACE, cwd_collect).await {
         Ok(Ok(Some(cwd))) => Some(cwd),
         Ok(Ok(None)) => None,
-        _ => {
+        Ok(Err(e)) => {
+            log(&format!("cwd report task failed: {e}; cwd unchanged"));
+            None
+        },
+        Err(_) => {
             log("cwd report did not terminate in time; cwd unchanged");
             None
         },
     };
     let new_state = match tokio::time::timeout(DRAIN_GRACE, state_collect).await {
         Ok(Ok(state)) => state,
-        _ => {
+        Ok(Err(e)) => {
+            log(&format!("state dump task failed: {e}; state unchanged"));
+            None
+        },
+        Err(_) => {
             log("state dump did not terminate in time; state unchanged");
             None
         },
