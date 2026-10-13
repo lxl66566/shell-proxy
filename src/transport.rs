@@ -213,6 +213,10 @@ mod security {
     }
 }
 
+/// Raw SID bytes of the current user, for caller-side user identity needs.
+#[cfg(windows)]
+pub(crate) use security::current_user_sid;
+
 /// Platform listener.
 pub enum IpcListener {
     #[cfg(windows)]
@@ -251,6 +255,14 @@ pub fn bind(path: &str) -> std::io::Result<IpcListener> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // The endpoint's parent (the app dir for default paths) must exist
+        // before bind; config::app_dir is a pure read.
+        if let Some(parent) = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
         let listener = tokio::net::UnixListener::bind(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         Ok(IpcListener::Unix {

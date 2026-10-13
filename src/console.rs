@@ -2,16 +2,18 @@
 //! instead of dying, so the exit code of the interrupted remote command is
 //! still reported.
 
+use spdlog::prelude::*;
 use tokio::sync::mpsc;
 
 use crate::proto::Signal;
 
 /// Install handlers that forward SIGINT/SIGTERM to `tx`.
 ///
-/// Call at most once per process. Windows needs a static sink because the
-/// console API takes a plain function pointer.
+/// Call at most once per process. Returns an error when the platform handler
+/// cannot be registered. Windows needs a static sink because the console API
+/// takes a plain function pointer.
 #[cfg(windows)]
-pub fn install(tx: mpsc::Sender<Signal>) {
+pub fn install(tx: mpsc::Sender<Signal>) -> Result<(), String> {
     static SINK: std::sync::OnceLock<mpsc::Sender<Signal>> = std::sync::OnceLock::new();
 
     /// # Safety
@@ -26,8 +28,10 @@ pub fn install(tx: mpsc::Sender<Signal>) {
             CTRL_C_EVENT | CTRL_BREAK_EVENT => Signal::Int,
             _ => return 0, // close/logoff: default handling kills us anyway
         };
-        if let Some(tx) = SINK.get() {
-            let _ = tx.try_send(sig);
+        if let Some(tx) = SINK.get()
+            && let Err(e) = tx.try_send(sig)
+        {
+            debug!("dropping {sig:?} signal, channel full: {e}");
         }
         TRUE // handled: keep running until the remote exit code arrives
     }
@@ -35,19 +39,24 @@ pub fn install(tx: mpsc::Sender<Signal>) {
     let _ = SINK.set(tx);
 
     // SAFETY: `handler` is a valid extern function; registration is idempotent.
-    unsafe {
-        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(handler), 1);
+    if unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(handler), 1) } == 0
+    {
+        return Err(format!(
+            "SetConsoleCtrlHandler: {}",
+            std::io::Error::last_os_error()
+        ));
     }
+    Ok(())
 }
 
 #[cfg(unix)]
-pub fn install(tx: mpsc::Sender<Signal>) {
+pub fn install(tx: mpsc::Sender<Signal>) -> Result<(), String> {
     use signal_hook::{
         consts::{SIGINT, SIGTERM},
         iterator::Signals,
     };
 
-    let mut signals = Signals::new([SIGINT, SIGTERM]).expect("register signal handlers");
+    let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(|e| e.to_string())?;
     std::thread::spawn(move || {
         for sig in signals.forever() {
             let s = if sig == SIGTERM {
@@ -60,4 +69,5 @@ pub fn install(tx: mpsc::Sender<Signal>) {
             }
         }
     });
+    Ok(())
 }

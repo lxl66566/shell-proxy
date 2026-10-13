@@ -61,7 +61,8 @@ impl Default for Config {
 ///
 /// `$XDG_CONFIG_HOME/shell-proxy` when `XDG_CONFIG_HOME` is set to an
 /// absolute path (honored on all platforms); otherwise `dirs::config_dir()`
-/// (`%APPDATA%` on Windows, `~/.config` on Unix).
+/// (`%APPDATA%` on Windows, `~/.config` on Unix). Pure read: use
+/// [`ensure_app_dir`] when the directory must exist.
 #[must_use]
 pub fn app_dir() -> PathBuf {
     let xdg = std::env::var_os("XDG_CONFIG_HOME")
@@ -72,9 +73,17 @@ pub fn app_dir() -> PathBuf {
     let base = xdg
         .or_else(dirs::config_dir)
         .unwrap_or_else(|| PathBuf::from(".shell-proxy"));
-    let dir = base.join("shell-proxy");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+    base.join("shell-proxy")
+}
+
+/// Create the app directory if missing and return its path. Callers that
+/// write inside the app dir surface creation failures here instead of at a
+/// distant write site.
+pub fn ensure_app_dir() -> Result<PathBuf> {
+    let dir = app_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| Error::Config(format!("create {}: {e}", dir.display())))?;
+    Ok(dir)
 }
 
 /// Path of the daemon IPC endpoint.
@@ -88,21 +97,35 @@ pub fn sock_path() -> String {
         return p;
     }
     if cfg!(windows) {
-        let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
-        let sane: String = user
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        format!(r"\\.\pipe\shell-proxy-{sane}")
+        windows_pipe_name()
     } else {
         app_dir().join("daemon.sock").to_string_lossy().into_owned()
     }
+}
+
+/// Named pipe path on Windows. Sanitizing the username can collide across
+/// accounts (`a-b` and `a_b` both map to `a_b`); a short hash of the account
+/// SID keeps the name stable per user yet distinct per account. Falls back to
+/// hashing the username when the SID is unavailable.
+#[cfg(windows)]
+fn windows_pipe_name() -> String {
+    use sha2::{Digest, Sha256};
+
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+    let sane: String = user
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let bytes = crate::transport::current_user_sid().unwrap_or_else(|_| user.into_bytes());
+    let digest = Sha256::digest(&bytes);
+    let suffix = &hex_simd::encode_to_string(&digest[..4], hex_simd::AsciiCase::Lower);
+    format!(r"\\.\pipe\shell-proxy-{sane}-{suffix}")
 }
 
 /// Load `config.toml` from the app dir. Missing file yields defaults.
@@ -184,6 +207,67 @@ mod tests {
         match old {
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+    }
+
+    #[test]
+    fn ensure_app_dir_creates_directory() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialized against every other env-mutating test
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        let dir = ensure_app_dir().unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(dir, tmp.path().join("shell-proxy"));
+        match old {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+    }
+
+    /// The SID-derived suffix is stable across calls and independent of the
+    /// sanitized username; distinct accounts get distinct SIDs, hence distinct
+    /// pipe names even when their sanitized names collide.
+    #[cfg(windows)]
+    #[test]
+    fn sock_path_suffix_is_stable_per_user() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old_sock = std::env::var_os(ENV_SOCK);
+        let old_user = std::env::var_os("USERNAME");
+        // SAFETY: serialized against every other env-mutating test
+        unsafe { std::env::remove_var(ENV_SOCK) };
+
+        let name = sock_path();
+        assert!(name.starts_with(r"\\.\pipe\shell-proxy-"));
+        let suffix = name.rsplit('-').next().unwrap_or_default();
+        assert_eq!(suffix.len(), 8);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Same account, colliding sanitized names: the suffix part is unchanged.
+        unsafe { std::env::set_var("USERNAME", "a-b") };
+        let with_dash = sock_path();
+        unsafe { std::env::set_var("USERNAME", "a_b") };
+        let with_underscore = sock_path();
+        assert!(with_dash.starts_with(r"\\.\pipe\shell-proxy-a_b-"));
+        assert!(with_underscore.starts_with(r"\\.\pipe\shell-proxy-a_b-"));
+        assert_eq!(
+            with_dash.rsplit('-').next(),
+            with_underscore.rsplit('-').next()
+        );
+        assert_eq!(sock_path(), with_underscore);
+
+        match old_sock {
+            Some(v) => unsafe { std::env::set_var(ENV_SOCK, v) },
+            None => unsafe { std::env::remove_var(ENV_SOCK) },
+        }
+        match old_user {
+            Some(v) => unsafe { std::env::set_var("USERNAME", v) },
+            None => unsafe { std::env::remove_var("USERNAME") },
         }
     }
 

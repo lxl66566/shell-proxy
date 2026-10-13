@@ -85,6 +85,17 @@ enum Sub {
 }
 
 fn main() -> ExitCode {
+    let cli = Cli::parse();
+    // The piped-stdin script is read before the runtime exists: a blocking
+    // read inside async code would park a tokio worker thread until stdin
+    // closes.
+    let stdin_script = match read_stdin_script(&cli) {
+        Ok(script) => script,
+        Err(e) => {
+            eprintln!("sp: read stdin: {e}");
+            return ExitCode::from(EXIT_INTERNAL);
+        },
+    };
     // Manual runtime: `shutdown_background` below must not wait for parked
     // blocking tasks. `tokio::io::stdin()` reads are dispatched to the
     // blocking pool, and a console read only completes on Enter - with the
@@ -94,14 +105,29 @@ fn main() -> ExitCode {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let code = rt.block_on(async_main());
+    let code = rt.block_on(async_main(cli, stdin_script));
     rt.shutdown_background();
     code
 }
 
-async fn async_main() -> ExitCode {
-    let cli = Cli::parse();
+/// Read the piped-stdin script candidate. Only the plain exec path (no
+/// subcommand, `--file`, or positional args) treats stdin as a script; every
+/// other invocation keeps its own stdin handling (notably `mcp`, which speaks
+/// its protocol over stdio).
+fn read_stdin_script(cli: &Cli) -> std::io::Result<Option<String>> {
+    if cli.sub.is_some()
+        || cli.file.is_some()
+        || !cli.cmd.is_empty()
+        || std::io::stdin().is_terminal()
+    {
+        return Ok(None);
+    }
+    let mut script = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut script)?;
+    Ok((!script.is_empty()).then_some(script))
+}
 
+async fn async_main(cli: Cli, stdin_script: Option<String>) -> ExitCode {
     match &cli.sub {
         Some(Sub::Daemon) => match shell_proxy::daemon::run().await {
             Ok(()) => ExitCode::SUCCESS,
@@ -130,7 +156,7 @@ async fn async_main() -> ExitCode {
         Some(Sub::Push { local, remote }) => run_push(&cli, local, remote).await,
         Some(Sub::Pull { remote, local }) => run_pull(&cli, remote, local).await,
         Some(Sub::Doctor) => run_doctor(&cli).await,
-        None => run_command(cli).await,
+        None => run_command(cli, stdin_script).await,
     }
 }
 
@@ -183,8 +209,19 @@ fn effective_timeout_ms(cli: &Cli) -> shell_proxy::Result<Option<u64>> {
     Ok((secs > 0).then(|| secs.saturating_mul(1000)))
 }
 
-async fn run_command(cli: Cli) -> ExitCode {
-    let (command, args) = match build_command(&cli) {
+async fn run_command(cli: Cli, stdin_script: Option<String>) -> ExitCode {
+    // The command line travels to the remote host as UTF-8 text; a lossy
+    // conversion would silently rewrite the command. Fail per argument
+    // (exit 2, clap's usage-error code).
+    let mut words = Vec::with_capacity(cli.cmd.len());
+    for arg in &cli.cmd {
+        let Some(word) = arg.to_str() else {
+            eprintln!("sp: argument {} is not valid UTF-8", arg.to_string_lossy());
+            return ExitCode::from(2);
+        };
+        words.push(word.to_owned());
+    }
+    let (command, args) = match build_command(&cli, &words, stdin_script) {
         Ok(Some(x)) => x,
         Ok(None) => {
             Cli::command().print_help().expect("print help");
@@ -357,7 +394,10 @@ async fn run_doctor(cli: &Cli) -> ExitCode {
 /// exit code, the shared tail of every exec-like subcommand.
 async fn exec_with_console(req: ExecRequest, io: RunIo<'_>) -> ExitCode {
     let (sig_tx, sig_rx) = mpsc::channel::<Signal>(4);
-    console::install(sig_tx);
+    if let Err(e) = console::install(sig_tx) {
+        eprintln!("sp: install signal handlers: {e}");
+        return ExitCode::from(EXIT_INTERNAL);
+    }
 
     match client::run(req, io, sig_rx).await {
         Ok(report) => {
@@ -378,37 +418,32 @@ async fn exec_with_console(req: ExecRequest, io: RunIo<'_>) -> ExitCode {
     }
 }
 
-/// Build the command text: file mode, positional args, or piped stdin.
-fn build_command(cli: &Cli) -> shell_proxy::Result<Option<(String, Vec<String>)>> {
-    let cmd_args = || {
-        cli.cmd
-            .iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect::<Vec<String>>()
-    };
+/// Build the command text: file mode, positional args, or the piped stdin
+/// script read before the runtime starts.
+fn build_command(
+    cli: &Cli,
+    words: &[String],
+    stdin_script: Option<String>,
+) -> shell_proxy::Result<Option<(String, Vec<String>)>> {
     if let Some(file) = &cli.file {
         let text = client::read_script_file(file)?;
         // Trailing args after `--` become the script's positional parameters.
-        return Ok(Some((text, cmd_args())));
+        return Ok(Some((text, words.to_vec())));
     }
-    if !cli.cmd.is_empty() {
+    if !words.is_empty() {
         // A lone argument that is not a bare word carries shell syntax the
         // local shell made the user quote (`sp "a | b"`): run it verbatim as a
         // command line, like ssh. Several arguments are words whose boundaries
         // must survive (`sp grep "a b" f`): re-quote each before joining.
-        if let [only] = cli.cmd.as_slice()
-            && !is_bare_word(&only.to_string_lossy())
+        if let [only] = words
+            && !is_bare_word(only)
         {
-            return Ok(Some((only.to_string_lossy().into_owned(), Vec::new())));
+            return Ok(Some((only.clone(), Vec::new())));
         }
-        return Ok(Some((join_command(&cmd_args()), Vec::new())));
+        return Ok(Some((join_command(words), Vec::new())));
     }
-    if !std::io::stdin().is_terminal() {
-        let mut script = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut script)?;
-        if !script.is_empty() {
-            return Ok(Some((script, Vec::new())));
-        }
+    if let Some(script) = stdin_script {
+        return Ok(Some((script, Vec::new())));
     }
     Ok(None)
 }

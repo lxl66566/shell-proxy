@@ -549,11 +549,20 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
     // Session buckets survive the eviction: cwd/state are strings tied to
     // the session, not the connection, and resume after the reconnect.
     if outcome.is_err() && conn.conn.is_closed() {
-        warn!(
-            "host={} connection lost, evicting connection (sessions keep their state)",
-            eff_req.host
-        );
-        shared.hosts.lock().await.remove(&eff_req.host);
+        let mut hosts = shared.hosts.lock().await;
+        // Evict only the exact instance that failed: a concurrent task may
+        // already have reconnected and installed a healthy connection, which
+        // an unconditional remove would discard for nothing.
+        if hosts
+            .get(&eff_req.host)
+            .is_some_and(|c| Arc::ptr_eq(c, &conn))
+        {
+            warn!(
+                "host={} connection lost, evicting connection (sessions keep their state)",
+                eff_req.host
+            );
+            hosts.remove(&eff_req.host);
+        }
     }
 
     let mut state_bytes = 0usize;
