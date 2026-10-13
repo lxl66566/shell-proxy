@@ -14,7 +14,11 @@ use std::{
 };
 
 use sp_proto::{EventFrame, ExecFrame, ExecRequest, ExitReport, INTERNAL_ERROR_CODE, Pong, Signal};
-use spdlog::{Level, LevelFilter, Logger, prelude::*, sink::FileSink};
+use spdlog::{
+    Level, LevelFilter, Logger,
+    prelude::*,
+    sink::{RotatingFileSink, RotationPolicy},
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{Mutex, mpsc},
@@ -29,8 +33,12 @@ use crate::{
     ssh_config,
 };
 
-/// Log files above this size are rotated to `.old` at daemon startup.
+/// Per-file size cap of the daemon log rotation; together with
+/// [`ROTATE_FILES`] it bounds a resident daemon's disk usage.
 const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+/// Total log files kept by the rotation: `daemon.log` plus suffixed older
+/// ones.
+const ROTATE_FILES: usize = 3;
 
 /// Extra slack over the request timeout before the daemon stops waiting for an
 /// exit report: covers serve's TERM-to-KILL escalation, its bounded pipe
@@ -333,12 +341,15 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
             sess.lock.lock().await
         },
     };
-    let start_cwd = req
+    // The effective request mutates the owned request in place instead of
+    // cloning it: command and client-sent state can be large (script files,
+    // up to 256KB blobs) and the clone's copies would be overwritten right
+    // away.
+    let mut eff_req = req;
+    let start_cwd = eff_req
         .cwd
-        .clone()
+        .take()
         .or_else(|| sess.cwd.lock().expect("cwd lock").clone());
-
-    let mut eff_req = req.clone();
     eff_req.cwd = start_cwd.clone();
     eff_req
         .state
@@ -460,7 +471,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
         if eff_req.timeout_ms.is_some_and(|ms| ms > 0) && watchdog.is_none() {
             warn!(
                 "host={} timeout_ms={} overflows the clock, running without a watchdog",
-                req.host,
+                eff_req.host,
                 eff_req.timeout_ms.unwrap_or_default(),
             );
         }
@@ -489,7 +500,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
                             warn!(
                                 "host={} client disconnected while the command was running; \
                                  letting it finish",
-                                req.host
+                                eff_req.host
                             );
                         },
                         Some(CtrlEvent::Fatal(msg)) => break Err(msg),
@@ -540,9 +551,9 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
     if outcome.is_err() && conn.conn.is_closed() {
         warn!(
             "host={} connection lost, evicting connection (sessions keep their state)",
-            req.host
+            eff_req.host
         );
-        shared.hosts.lock().await.remove(&req.host);
+        shared.hosts.lock().await.remove(&eff_req.host);
     }
 
     let mut state_bytes = 0usize;
@@ -576,7 +587,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
 
     info!(
         "exec host={} session={} cwd={} rc={} dur={}ms out={}B err={}B state={}B cmd={}",
-        req.host,
+        eff_req.host,
         session,
         start_cwd.as_deref().unwrap_or("~"),
         report.code,
@@ -584,7 +595,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
         stdout_bytes.load(Ordering::Relaxed),
         stderr_bytes.load(Ordering::Relaxed),
         state_bytes,
-        abbreviate(&req.command),
+        abbreviate(&eff_req.command),
     );
 
     let _ = out_tx.send(EventFrame::Exit(report)).await;
@@ -683,18 +694,21 @@ async fn get_session(shared: &Arc<Shared>, host: &str, session: &SessionId) -> A
 fn init_logger() -> std::io::Result<()> {
     let dir = config::app_dir().join("logs");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join("daemon.log");
-    if let Ok(meta) = std::fs::metadata(&path)
-        && meta.len() > ROTATE_BYTES
-    {
-        let _ = std::fs::rename(&path, dir.join("daemon.log.old"));
-    }
-    let sink = FileSink::builder()
-        .path(&path)
+    // The sink rotates the moment a record pushes the file past the cap (an
+    // already-oversized file rotates on the first write), so a resident
+    // daemon's log stays bounded at any uptime.
+    let sink = RotatingFileSink::builder()
+        .base_path(dir.join("daemon.log"))
+        .rotation_policy(RotationPolicy::FileSize(ROTATE_BYTES))
+        .max_files(ROTATE_FILES)
         .build()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let level =
-        config::load_config().map_or(LevelFilter::MoreSevere(Level::Info), |c| c.log_level.into());
+    // The CLI hard-fails on a broken config; the daemon must stay up, so it
+    // falls back to Info - which also lets the warning below through.
+    let (level, config_err) = match config::load_config() {
+        Ok(c) => (c.log_level.into(), None),
+        Err(e) => (LevelFilter::MoreSevere(Level::Info), Some(e)),
+    };
     let logger = Logger::builder()
         .sink(Arc::new(sink))
         .level_filter(level)
@@ -703,6 +717,9 @@ fn init_logger() -> std::io::Result<()> {
         .build()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     spdlog::set_default_logger(Arc::new(logger));
+    if let Some(e) = config_err {
+        warn!("config load failed, using the default log level: {e}");
+    }
     Ok(())
 }
 
