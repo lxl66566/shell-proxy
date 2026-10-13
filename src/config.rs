@@ -41,6 +41,10 @@ pub struct Config {
     pub host: Option<String>,
     /// Daemon log level.
     pub log_level: LogLevel,
+    /// Default command timeout in seconds for CLI runs without `--timeout`
+    /// (0 = unlimited). An explicit `--timeout` always wins. The MCP server
+    /// keeps its own fixed default.
+    pub default_timeout_secs: u64,
 }
 
 impl Default for Config {
@@ -48,6 +52,7 @@ impl Default for Config {
         Self {
             host: None,
             log_level: LogLevel::Info,
+            default_timeout_secs: 0,
         }
     }
 }
@@ -176,6 +181,32 @@ mod tests {
         // relative value is ignored per XDG spec
         unsafe { std::env::set_var("XDG_CONFIG_HOME", "rel/path") };
         assert_ne!(app_dir(), PathBuf::from("rel/path").join("shell-proxy"));
+        match old {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+    }
+
+    #[test]
+    fn load_config_reads_default_timeout_secs() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("shell-proxy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialized against every other env-mutating test
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+
+        std::fs::write(&path, "default_timeout_secs = 120\n").unwrap();
+        assert_eq!(load_config().unwrap().default_timeout_secs, 120);
+
+        // Absent key keeps the zero default (unlimited).
+        std::fs::write(&path, "log_level = \"warn\"\n").unwrap();
+        assert_eq!(load_config().unwrap().default_timeout_secs, 0);
+
         match old {
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },

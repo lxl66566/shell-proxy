@@ -41,6 +41,13 @@ const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 /// the host lock.
 const WATCHDOG_GRACE: Duration = Duration::from_secs(15);
 
+/// Waiting time on the session lock after which a queued command is reported
+/// to the log: one wedged command would otherwise block every later command
+/// of the session with no trace anywhere. The note goes only to the daemon
+/// log; injecting a frame into the client's stderr would corrupt piped
+/// output.
+const SESSION_QUEUE_WARN: Duration = Duration::from_secs(2);
+
 /// Overall budget for first contact with a host: the ssh connect (whose
 /// transport, handshake and authentication stages each carry their own finer
 /// timeouts in the ssh layer) plus the sp-serve deploy it triggers (arch
@@ -106,8 +113,19 @@ struct Shared {
 pub async fn run() -> Result<()> {
     init_logger().map_err(|e| Error::Daemon(format!("init logging: {e}")))?;
     let sock_path = config::sock_path();
-    let listener = crate::transport::bind(&sock_path)
-        .map_err(|e| Error::Daemon(format!("bind {sock_path}: {e}")))?;
+    // Fatal startup errors must reach the log file: an auto-spawned daemon has
+    // its stdio redirected to null, so the client only ever sees "did not
+    // come up" and the real cause would be lost. (When init_logger itself
+    // failed there is no log to write to; the error still reaches callers
+    // that run the daemon in the foreground.)
+    let listener = match crate::transport::bind(&sock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            let err = Error::Daemon(format!("bind {sock_path}: {e}"));
+            error!("daemon failed to start: {err}");
+            return Err(err);
+        },
+    };
 
     info!("daemon started pid={} sock={sock_path}", std::process::id());
 
@@ -131,8 +149,17 @@ pub async fn run() -> Result<()> {
         };
         tokio::select! {
             res = listener.accept() => {
-                let stream = res
-                    .map_err(|e| Error::Daemon(format!("accept on {sock_path}: {e}")))?;
+                let stream = match res {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Only bind-class fatal errors reach this arm (accept
+                        // retries transient failures); same logging rationale
+                        // as the bind failure above.
+                        let err = Error::Daemon(format!("accept on {sock_path}: {e}"));
+                        error!("daemon exiting: {err}");
+                        return Err(err);
+                    },
+                };
                 let shared = Arc::clone(&shared);
                 let guard = ActiveGuard::acquire(&active, &idle_now);
                 tokio::spawn(async move {
@@ -286,7 +313,26 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
         },
     };
     let sess = get_session(shared, &req.host, &session).await;
-    let _guard = sess.lock.lock().await;
+    // Sessions serialize on this lock for their whole execution; a command
+    // queued behind a running one waits here (bounded by that command's end
+    // or its watchdog). Report the ones stuck past the threshold while they
+    // are still queued, so even a never-returning command leaves a trace.
+    let queued_at = Instant::now();
+    let _guard = match tokio::time::timeout(SESSION_QUEUE_WARN, sess.lock.lock()).await {
+        Ok(guard) => guard,
+        Err(_elapsed) => {
+            warn!(
+                "host={} session={} still queued behind a running command after {}ms (commands \
+                 within a session serialize; a long-running command without a timeout blocks the \
+                 session); cmd={}",
+                req.host,
+                session,
+                queued_at.elapsed().as_millis(),
+                abbreviate(&req.command),
+            );
+            sess.lock.lock().await
+        },
+    };
     let start_cwd = req
         .cwd
         .clone()

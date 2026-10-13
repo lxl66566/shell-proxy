@@ -4,7 +4,7 @@ use std::{io::IsTerminal, path::PathBuf, process::ExitCode};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use shell_proxy::{
-    check_timeout_ms,
+    Error, check_timeout_ms,
     client::{self, RunIo, is_bare_word},
     config, console,
     proto::{self, ExecRequest, Signal},
@@ -138,7 +138,7 @@ async fn async_main() -> ExitCode {
 /// error and bail with the internal exit code. Every exec-like subcommand
 /// resolves both the same way.
 fn resolve_target(cli: &Cli) -> Option<(String, String)> {
-    let fail = |e: shell_proxy::Error| {
+    let fail = |e: Error| {
         eprintln!("sp: {e}");
         None
     };
@@ -168,6 +168,21 @@ fn parse_timeout_secs(s: &str) -> Result<u64, String> {
     Ok(secs)
 }
 
+/// Effective command timeout in ms: an explicit `--timeout` wins, otherwise
+/// the config's `default_timeout_secs` applies (0 = no timeout). Config-sourced
+/// values pass the same bound as `--timeout`.
+fn effective_timeout_ms(cli: &Cli) -> shell_proxy::Result<Option<u64>> {
+    let secs = if let Some(secs) = cli.timeout {
+        secs
+    } else {
+        let secs = config::load_config()?.default_timeout_secs;
+        check_timeout_ms(secs.saturating_mul(1000))
+            .map_err(|e| Error::Config(format!("default_timeout_secs: {e}")))?;
+        secs
+    };
+    Ok((secs > 0).then(|| secs.saturating_mul(1000)))
+}
+
 async fn run_command(cli: Cli) -> ExitCode {
     let (command, args) = match build_command(&cli) {
         Ok(Some(x)) => x,
@@ -185,13 +200,21 @@ async fn run_command(cli: Cli) -> ExitCode {
         return ExitCode::from(EXIT_INTERNAL);
     };
 
+    let timeout = match effective_timeout_ms(&cli) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("sp: {e}");
+            return ExitCode::from(EXIT_INTERNAL);
+        },
+    };
+
     let req = ExecRequest {
         host,
         command,
         args,
         cwd: cli.cwd,
         state: None,
-        timeout_ms: cli.timeout.map(timeout_ms),
+        timeout_ms: timeout,
         session: Some(session),
     };
 
@@ -237,13 +260,14 @@ async fn run_push(cli: &Cli, local: &std::path::Path, remote: &str) -> ExitCode 
         stdout: Box::new(tokio::io::stdout()),
         stderr: Box::new(tokio::io::stderr()),
     };
-    let req = client::upload_request(
-        host,
-        session,
-        remote,
-        cli.cwd.clone(),
-        cli.timeout.map(timeout_ms),
-    );
+    let timeout = match effective_timeout_ms(cli) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("sp: {e}");
+            return ExitCode::from(EXIT_INTERNAL);
+        },
+    };
+    let req = client::upload_request(host, session, remote, cli.cwd.clone(), timeout);
     exec_with_console(req, io).await
 }
 
@@ -268,13 +292,14 @@ async fn run_pull(cli: &Cli, remote: &str, local: &std::path::Path) -> ExitCode 
         stdout,
         stderr: Box::new(tokio::io::stderr()),
     };
-    let req = client::download_request(
-        host,
-        session,
-        remote,
-        cli.cwd.clone(),
-        cli.timeout.map(timeout_ms),
-    );
+    let timeout = match effective_timeout_ms(cli) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("sp: {e}");
+            return ExitCode::from(EXIT_INTERNAL);
+        },
+    };
+    let req = client::download_request(host, session, remote, cli.cwd.clone(), timeout);
     exec_with_console(req, io).await
 }
 
@@ -351,10 +376,6 @@ async fn exec_with_console(req: ExecRequest, io: RunIo<'_>) -> ExitCode {
             ExitCode::from(EXIT_INTERNAL)
         },
     }
-}
-
-fn timeout_ms(secs: u64) -> u64 {
-    secs.saturating_mul(1000)
 }
 
 /// Build the command text: file mode, positional args, or piped stdin.

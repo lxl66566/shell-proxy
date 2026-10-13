@@ -53,7 +53,8 @@ pub async fn connect_or_spawn() -> Result<IpcStream> {
             Ok(s) => return Ok(s),
             Err(e) if Instant::now() >= deadline => {
                 return Err(Error::Daemon(format!(
-                    "daemon did not come up at {path}: {e}"
+                    "daemon did not come up at {path}: {e}; the cause is in the daemon log, run \
+                     `sp daemon` in the foreground to diagnose"
                 )));
             },
             Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
