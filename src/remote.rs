@@ -27,6 +27,10 @@ use crate::{
 /// Directory (relative to the remote home) holding deployed binaries.
 const SERVE_DIR: &str = "~/.local/share/shell-proxy";
 
+/// Minimum age (minutes) of an orphaned `.upload-*` temp file before cleanup
+/// removes it; anything younger may belong to a deploy in flight.
+const UPLOAD_GC_MINUTES: u64 = 10;
+
 /// Bounded wait for the forwarder to drain its backlog and close the channel
 /// once the execution finished or was abandoned. A remote stdin window that
 /// never reopens must not hold `execute` (and through it the session lock)
@@ -109,33 +113,79 @@ pub async fn deploy(handle: &SshHandle) -> Result<String> {
 
     let name = format!("sp-serve-{}-{}", env!("CARGO_PKG_VERSION"), arch.as_str());
     let path = format!("{SERVE_DIR}/{name}");
-    if remote_matches(handle, &path, bin).await? {
-        if let Err(e) = cleanup_stale(handle, &name).await {
-            warn!("stale deployment cleanup failed: {e}");
-        }
-        return Ok(path);
-    }
-
-    exec_status(handle, &format!("mkdir -p {SERVE_DIR}")).await?;
-    let tmp = format!("{SERVE_DIR}/.upload-{}", new_nonce());
-    upload(handle, &tmp, bin).await?;
-    exec_status(handle, &format!("chmod 700 {tmp}")).await?;
-    // Rename is atomic on the same filesystem: no half-written serve binary.
-    exec_status(handle, &format!("mv {tmp} {path}")).await?;
     if !remote_matches(handle, &path, bin).await? {
-        return Err(Error::Remote(format!(
-            "deployed {path} failed checksum verification"
-        )));
+        exec_status(handle, &format!("mkdir -p {SERVE_DIR}")).await?;
+        let tmp = format!("{SERVE_DIR}/.upload-{}", new_nonce());
+        upload(handle, &tmp, bin).await?;
+        exec_status(handle, &format!("chmod 700 {tmp}")).await?;
+        // Rename is atomic on the same filesystem: no half-written serve binary.
+        exec_status(handle, &format!("mv {tmp} {path}")).await?;
+        if !remote_matches(handle, &path, bin).await? {
+            return Err(Error::Remote(format!(
+                "deployed {path} failed checksum verification"
+            )));
+        }
+        info!("deployed {path} ({} bytes)", bin.len());
     }
     if let Err(e) = cleanup_stale(handle, &name).await {
         warn!("stale deployment cleanup failed: {e}");
     }
-    info!("deployed {path} ({} bytes)", bin.len());
+    // Runs once per connection (deploy is called only from first contact), not
+    // once per command: one extra exec round-trip is cheap next to a deploy.
+    check_serve_version(handle, &path, arch).await?;
     Ok(path)
+}
+
+/// Verify the deployed binary reports this build's sp-serve version.
+///
+/// The checksum above only proves "remote file == embedded bytes". When
+/// `SP_SERVE_X86_64` / `SP_SERVE_AARCH64` embeds a stale sp-serve build, that
+/// holds too - and every later command fails with opaque protocol errors. The
+/// version line catches it at first contact with a precise message instead.
+async fn check_serve_version(handle: &SshHandle, path: &str, arch: Arch) -> Result<()> {
+    let expected = format!("sp-serve {}", env!("SP_SERVE_VERSION"));
+    let (rc, out, _) = exec_collect(handle, &format!("{path} --version")).await?;
+    verify_serve_version(&out, rc, &expected)
+        .map_err(|reason| version_mismatch(path, arch, &reason))
+}
+
+/// Pure validation of a `sp-serve --version` probe: status 0 and exactly one
+/// line `sp-serve <version>` (one trailing newline tolerated).
+fn verify_serve_version(
+    stdout: &[u8],
+    status: i32,
+    expected: &str,
+) -> std::result::Result<(), String> {
+    let got = String::from_utf8_lossy(stdout);
+    let got = got.strip_suffix('\n').unwrap_or(&got);
+    if status == 0 && got == expected {
+        return Ok(());
+    }
+    if status != 0 {
+        Err(format!("exit status {status}, output {:?}", got.trim()))
+    } else {
+        Err(format!("reported {got:?}, expected {expected:?}"))
+    }
+}
+
+/// Error for a failed [`verify_serve_version`], naming the override that most
+/// likely caused it.
+fn version_mismatch(path: &str, arch: Arch, reason: &str) -> Error {
+    Error::Remote(format!(
+        "deployed {path} failed the version check ({reason}); {} may point at a stale sp-serve \
+         build - rebuild it from this source tree",
+        arch.env_var()
+    ))
 }
 
 /// Remove stale deployments (old versions, orphaned uploads) from SERVE_DIR,
 /// keeping `keep` (the just-verified binary name).
+///
+/// Versioned `sp-serve-*` files other than `keep` are deleted right away: a
+/// concurrent deploy of the same daemon version uploads under its own temp
+/// name and renames onto the same final path, so it never holds another
+/// version's file. Upload temps are deleted only past [`UPLOAD_GC_MINUTES`] of
+/// age: a fresh `.upload-*` may belong to a deploy in flight.
 ///
 /// Only names this tool could have generated are considered, and each must
 /// match a strict character set before it is put into the `rm` command line -
@@ -152,12 +202,31 @@ async fn cleanup_stale(handle: &SshHandle, keep: &str) -> Result<()> {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     };
-    let stale: Vec<String> = String::from_utf8_lossy(&out)
+    let mut stale: Vec<String> = String::from_utf8_lossy(&out)
         .lines()
         .map(str::trim)
         .filter(|n| *n != keep && tool_generated(n))
         .map(|n| format!("{SERVE_DIR}/{n}"))
         .collect();
+    // Orphaned upload temps, by age: `find` lists dotfiles (plain `ls` does
+    // not) and `-mmin` keeps a concurrent deploy's fresh temp out of the
+    // delete set. Missing `find` only skips this part.
+    let find = format!("find {SERVE_DIR} -maxdepth 1 -name '.upload-*' -mmin +{UPLOAD_GC_MINUTES}");
+    match exec_collect(handle, &find).await {
+        Ok((0, fout, _)) => {
+            stale.extend(
+                String::from_utf8_lossy(&fout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|p| p.rsplit('/').next().is_some_and(tool_generated))
+                    .map(str::to_owned),
+            );
+        },
+        Ok((frc, ..)) => {
+            warn!("upload temp cleanup skipped, find exited with rc={frc}");
+        },
+        Err(e) => return Err(e),
+    }
     if stale.is_empty() {
         return Ok(());
     }
@@ -389,12 +458,24 @@ pub async fn execute(
     let mut serve_log = ServeLog::default();
     let mut report: Option<ExitReport> = None;
     let mut serve_status: Option<u32> = None;
+    // A decode failure ends the execution via the unified teardown below
+    // instead of an early return: the serve log buffer may hold the very
+    // diagnostics that explain the corruption, and the channel tasks must
+    // still be joined.
+    let mut decode_err: Option<sp_proto::Error> = None;
 
     'outer: loop {
         match msg_rx.recv().await {
             None | Some(ChanEvent::Closed) => break,
             Some(ChanEvent::Data(bytes)) => {
-                for frame in decoder.push(&bytes)? {
+                let frames = match decoder.push(&bytes) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        decode_err = Some(e);
+                        break 'outer;
+                    },
+                };
+                for frame in frames {
                     match frame {
                         EventFrame::Stdout(d) => {
                             let _ = output.send(OutputEvent::Stdout(d)).await;
@@ -417,6 +498,10 @@ pub async fn execute(
 
     serve_log.flush();
     engine_tasks.finish().await;
+
+    if let Some(e) = decode_err {
+        return Err(e.into());
+    }
 
     match report {
         Some(rep) => Ok(ExecOutcome {
@@ -767,5 +852,26 @@ mod tests {
         shutdown.fire(); // idempotent
         assert!(rx.changed().await.is_ok());
         assert!(*rx.borrow_and_update());
+    }
+
+    #[test]
+    fn serve_version_probe_matches_exactly_one_line() {
+        let expected = "sp-serve 1.2.3";
+        assert!(verify_serve_version(b"sp-serve 1.2.3\n", 0, expected).is_ok());
+        assert!(verify_serve_version(b"sp-serve 1.2.3", 0, expected).is_ok());
+        // A stale binary reports its own, older version.
+        assert!(verify_serve_version(b"sp-serve 0.0.1\n", 0, expected).is_err());
+        // Extra or missing output means it is not the one-line reporter.
+        assert!(verify_serve_version(b"sp-serve 1.2.3\njunk\n", 0, expected).is_err());
+        assert!(verify_serve_version(b"", 0, expected).is_err());
+        assert!(verify_serve_version(b"sp-serve 1.2.3", 1, expected).is_err());
+    }
+
+    #[test]
+    fn version_mismatch_names_the_override_env_var() {
+        let msg = version_mismatch("path", Arch::X86_64, "reason").to_string();
+        assert!(msg.contains("SP_SERVE_X86_64"));
+        assert!(!msg.contains("SP_SERVE_AARCH64"));
+        assert!(msg.contains("reason"));
     }
 }

@@ -25,6 +25,17 @@ const TARGETS: [(&str, &str, &str); 2] = [
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
+    // The daemon checks the deployed binary reports this version (see
+    // remote.rs); a version bump must re-embed and re-check.
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let serve_manifest = manifest_dir
+        .join("crates")
+        .join("sp-serve")
+        .join("Cargo.toml");
+    println!("cargo:rerun-if-changed={}", serve_manifest.display());
+    let serve_version = package_version(&serve_manifest);
+    println!("cargo:rustc-env=SP_SERVE_VERSION={serve_version}");
     // Relative values resolve against the build script's cwd (package root),
     // the same place the default `target/` lives.
     let target_dir = env::var_os("CARGO_TARGET_DIR")
@@ -56,4 +67,29 @@ fn main() {
             std::fs::write(&dest, []).expect("write empty placeholder");
         }
     }
+}
+
+/// `package.version` of the sp-serve manifest. A line scan avoids a build-time
+/// toml dependency; the manifest is small, hand-written and package-owned.
+fn package_version(path: &std::path::Path) -> String {
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let mut in_package = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+        } else if in_package
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == "version"
+            && let Some(v) = value
+                .trim()
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+            && !v.is_empty()
+        {
+            return v.to_owned();
+        }
+    }
+    panic!("no [package] version in {}", path.display());
 }

@@ -37,6 +37,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow     = "1"
+base64     = "0.22"
 clap       = { version = "4", features = ["derive"] }
 dirs       = "7"
 hex-simd   = "0.8"

@@ -1,7 +1,11 @@
-//! MCP server exposing the remote shell as `exec`, `read_file` and
-//! `write_file` tools.
+//! MCP server exposing the remote shell as `exec`, `read_file`/`write_file`
+//! and their base64 twins for binary content.
 
 use anyhow::Result;
+use base64::{
+    Engine as _,
+    engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
+};
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
@@ -22,6 +26,13 @@ use crate::{
 /// Default per-call timeout for MCP-driven executions.
 const DEFAULT_TIMEOUT_MS: u64 = 600_000;
 
+/// Standard base64 alphabet; decoding also accepts unpadded input, which
+/// callers frequently emit.
+const BASE64: GeneralPurpose = GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ExecParams {
@@ -31,6 +42,10 @@ struct ExecParams {
     /// 0 disables the timeout; values above 24 h are rejected as invalid.
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// Target host alias (resolved through the system ssh config); defaults to
+    /// the configured host.
+    #[serde(default)]
+    host: Option<String>,
     /// Session name: independent cwd/state per session on the same host.
     #[serde(default)]
     session: Option<String>,
@@ -41,6 +56,10 @@ struct ExecParams {
 struct ReadFileParams {
     /// Remote path; relative paths resolve against the session's persisted cwd.
     path: String,
+    /// Target host alias (resolved through the system ssh config); defaults to
+    /// the configured host.
+    #[serde(default)]
+    host: Option<String>,
     /// Session name: independent cwd/state per session on the same host.
     #[serde(default)]
     session: Option<String>,
@@ -53,6 +72,40 @@ struct WriteFileParams {
     path: String,
     /// UTF-8 file content, written verbatim (truncates).
     content: String,
+    /// Target host alias (resolved through the system ssh config); defaults to
+    /// the configured host.
+    #[serde(default)]
+    host: Option<String>,
+    /// Session name: independent cwd/state per session on the same host.
+    #[serde(default)]
+    session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadFileBinaryParams {
+    /// Remote path; relative paths resolve against the session's persisted cwd.
+    path: String,
+    /// Target host alias (resolved through the system ssh config); defaults to
+    /// the configured host.
+    #[serde(default)]
+    host: Option<String>,
+    /// Session name: independent cwd/state per session on the same host.
+    #[serde(default)]
+    session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WriteFileBinaryParams {
+    /// Remote path; relative paths resolve against the session's persisted cwd.
+    path: String,
+    /// Base64-encoded file content, decoded before writing (truncates).
+    content_b64: String,
+    /// Target host alias (resolved through the system ssh config); defaults to
+    /// the configured host.
+    #[serde(default)]
+    host: Option<String>,
     /// Session name: independent cwd/state per session on the same host.
     #[serde(default)]
     session: Option<String>,
@@ -70,7 +123,7 @@ impl SpMcp {
                        independent."
     )]
     async fn exec(&self, params: Parameters<ExecParams>) -> Result<CallToolResult, McpError> {
-        let host = resolve_host()?;
+        let host = resolve_host(params.0.host.as_deref())?;
         let session = resolve_session(params.0.session.as_deref())?;
         // Model-controlled input: an oversized value is a caller error, the
         // command must not run.
@@ -86,9 +139,15 @@ impl SpMcp {
             session: Some(session.as_str().to_owned()),
         };
         let (report, stdout, stderr, dropped) = call(req, Vec::new()).await?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            format_report(&report, &stdout, &stderr, &dropped),
-        )]))
+        let text = format_report(&report, &stdout, &stderr, &dropped);
+        // MCP hosts key retry and correction off isError: a non-zero exit
+        // (including 254 internal and 124 timeout) or a reported error is a
+        // failed call, not a success carrying error text.
+        if report.code != 0 || report.error.is_some() {
+            Ok(CallToolResult::error(vec![ContentBlock::text(text)]))
+        } else {
+            Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+        }
     }
 
     #[tool(description = "Read a remote file (UTF-8 text).")]
@@ -96,7 +155,7 @@ impl SpMcp {
         &self,
         params: Parameters<ReadFileParams>,
     ) -> Result<CallToolResult, McpError> {
-        let host = resolve_host()?;
+        let host = resolve_host(params.0.host.as_deref())?;
         let session = resolve_session(params.0.session.as_deref())?;
         let req = client::download_request(
             host,
@@ -105,14 +164,24 @@ impl SpMcp {
             None,
             Some(DEFAULT_TIMEOUT_MS),
         );
-        let (report, stdout, stderr, dropped) = call(req, Vec::new()).await?;
-        if let Some(err) = file_result(&report, &stdout, &stderr, &dropped) {
-            Ok(CallToolResult::error(vec![ContentBlock::text(err)]))
-        } else {
-            let mut text = clip(&stdout);
-            push_dropped(&mut text, &dropped);
-            Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
-        }
+        read_remote(req, OutputEncoding::Text).await
+    }
+
+    #[tool(description = "Read a remote file as base64 (binary-safe).")]
+    async fn read_file_binary(
+        &self,
+        params: Parameters<ReadFileBinaryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let host = resolve_host(params.0.host.as_deref())?;
+        let session = resolve_session(params.0.session.as_deref())?;
+        let req = client::download_request(
+            host,
+            session.as_str().to_owned(),
+            &params.0.path,
+            None,
+            Some(DEFAULT_TIMEOUT_MS),
+        );
+        read_remote(req, OutputEncoding::Base64).await
     }
 
     #[tool(description = "Write UTF-8 text to a remote file (truncates).")]
@@ -120,7 +189,7 @@ impl SpMcp {
         &self,
         params: Parameters<WriteFileParams>,
     ) -> Result<CallToolResult, McpError> {
-        let host = resolve_host()?;
+        let host = resolve_host(params.0.host.as_deref())?;
         let session = resolve_session(params.0.session.as_deref())?;
         let req = client::upload_request(
             host,
@@ -129,21 +198,37 @@ impl SpMcp {
             None,
             Some(DEFAULT_TIMEOUT_MS),
         );
-        let content = params.0.content;
-        let len = content.len();
-        let (report, _, stderr, dropped) = call(req, content.into_bytes()).await?;
-        if let Some(err) = file_result(&report, b"", &stderr, &dropped) {
-            Ok(CallToolResult::error(vec![ContentBlock::text(err)]))
-        } else {
-            let mut text = format!("wrote {} ({len} bytes)", params.0.path);
-            push_dropped(&mut text, &dropped);
-            Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
-        }
+        write_remote(req, params.0.content.into_bytes(), &params.0.path).await
+    }
+
+    #[tool(description = "Write base64-decoded bytes to a remote file (truncates).")]
+    async fn write_file_binary(
+        &self,
+        params: Parameters<WriteFileBinaryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let host = resolve_host(params.0.host.as_deref())?;
+        let session = resolve_session(params.0.session.as_deref())?;
+        let content = BASE64
+            .decode(params.0.content_b64.as_bytes())
+            .map_err(|e| McpError::invalid_params(format!("content_b64: {e}"), None))?;
+        let req = client::upload_request(
+            host,
+            session.as_str().to_owned(),
+            &params.0.path,
+            None,
+            Some(DEFAULT_TIMEOUT_MS),
+        );
+        write_remote(req, content, &params.0.path).await
     }
 }
 
-fn resolve_host() -> Result<String, McpError> {
-    config::resolve_host(None).map_err(|e| McpError::internal_error(e.brief(), None))
+/// Tool arg > `SP_HOST` env > config file. An empty arg or a missing default
+/// host is a caller error.
+fn resolve_host(cli: Option<&str>) -> Result<String, McpError> {
+    if cli.is_some_and(str::is_empty) {
+        return Err(McpError::invalid_params("host must not be empty", None));
+    }
+    config::resolve_host(cli).map_err(|e| McpError::invalid_params(e.brief(), None))
 }
 
 /// Tool arg > `SP_SESSION` env > default; an invalid name from either source
@@ -163,6 +248,49 @@ async fn call(
     client::run_captured_capped(req, stdin, signals_rx)
         .await
         .map_err(|e| McpError::internal_error(e.brief(), None))
+}
+
+/// How the captured file bytes appear in a read tool result.
+enum OutputEncoding {
+    Text,
+    Base64,
+}
+
+/// Shared body of the read tools: failures render as an error result,
+/// success returns the captured stdout, optionally base64-encoded, clipped to
+/// the tool cap.
+async fn read_remote(
+    req: ExecRequest,
+    encoding: OutputEncoding,
+) -> Result<CallToolResult, McpError> {
+    let (report, stdout, stderr, dropped) = call(req, Vec::new()).await?;
+    if let Some(err) = file_result(&report, &stdout, &stderr, &dropped) {
+        return Ok(CallToolResult::error(vec![ContentBlock::text(err)]));
+    }
+    let mut text = match encoding {
+        OutputEncoding::Text => clip(&stdout),
+        // base64 is ASCII, so clipping its bytes never splits a character.
+        OutputEncoding::Base64 => clip(BASE64.encode(&stdout).as_bytes()),
+    };
+    push_dropped(&mut text, &dropped);
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+}
+
+/// Shared body of the write tools: upload `content`, failures render as an
+/// error result, success returns a one-line confirmation.
+async fn write_remote(
+    req: ExecRequest,
+    content: Vec<u8>,
+    path: &str,
+) -> Result<CallToolResult, McpError> {
+    let len = content.len();
+    let (report, _, stderr, dropped) = call(req, content).await?;
+    if let Some(err) = file_result(&report, b"", &stderr, &dropped) {
+        return Ok(CallToolResult::error(vec![ContentBlock::text(err)]));
+    }
+    let mut text = format!("wrote {path} ({len} bytes)");
+    push_dropped(&mut text, &dropped);
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
 /// Failure rendering shared by the file tools: `None` means success.
@@ -265,6 +393,10 @@ fn format_report(
     out.push_str(&clip(stderr));
     if !stderr.is_empty() && !out.ends_with('\n') {
         out.push('\n');
+    }
+    // The reported cwd saves the caller a follow-up `pwd` to track the session.
+    if let Some(cwd) = &report.cwd {
+        let _ = writeln!(out, "cwd: {cwd}");
     }
     push_dropped(&mut out, dropped);
     out

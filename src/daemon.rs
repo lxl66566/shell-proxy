@@ -47,7 +47,8 @@ const WATCHDOG_GRACE: Duration = Duration::from_secs(15);
 /// probe, checksum, upload - plain exec channels no ssh-layer timeout
 /// covers). Bounds callers that cannot interrupt themselves (MCP) and CLI
 /// requests without a timeout. Cancelling mid-deploy can leave an orphaned
-/// `.upload-*` temp file; the next deploy's stale cleanup removes it.
+/// `.upload-*` temp file; the stale cleanup removes it once it ages past its
+/// threshold.
 const CONNECT_DEPLOY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `Instant::now() + d`, checked. A bare `+` panics on clock overflow and
@@ -89,6 +90,13 @@ struct SessionKey {
 #[derive(Default)]
 struct Shared {
     hosts: Mutex<HashMap<String, Arc<HostConn>>>,
+    /// Serializes first contact (connect + deploy) per host, eliminating the
+    /// race of two concurrent cache misses each running a deploy whose stale
+    /// cleanup interferes with the other's upload. Entries are never removed:
+    /// each is one small mutex and the count is bounded by the distinct hosts
+    /// this daemon has ever contacted. Cached-connection lookups never take
+    /// these locks, so ordinary commands on a connected host run in parallel.
+    connecting: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     sessions: Mutex<HashMap<SessionKey, Arc<SessionState>>>,
 }
 
@@ -553,8 +561,9 @@ fn abbreviate(s: &str) -> String {
 ///
 /// The map lock is never held across the connect: a slow or timing-out
 /// connect to one host must not block commands to already-connected hosts.
-/// On a connect race the losing connection is dropped; the winner's state
-/// stays in the map.
+/// Cache misses serialize on a per-host lock (see [`Shared::connecting`]) so
+/// only one task deploys at a time; the map-level "another task connected
+/// first" check stays as defense in depth.
 ///
 /// A fresh connect, including the deploy inside it, runs under
 /// [`CONNECT_DEPLOY_TIMEOUT`] - cached connections skip the bound entirely.
@@ -562,6 +571,15 @@ async fn get_or_connect(shared: &Arc<Shared>, host: &str) -> Result<Arc<HostConn
     let live = |hosts: &HashMap<String, Arc<HostConn>>| {
         hosts.get(host).filter(|c| !c.conn.is_closed()).cloned()
     };
+    if let Some(conn) = live(&*shared.hosts.lock().await) {
+        return Ok(conn);
+    }
+    let first_contact = {
+        let mut connecting = shared.connecting.lock().await;
+        Arc::clone(connecting.entry(host.to_owned()).or_default())
+    };
+    let _serialized = first_contact.lock().await;
+    // The previous lock holder may have connected in the meantime.
     if let Some(conn) = live(&*shared.hosts.lock().await) {
         return Ok(conn);
     }

@@ -415,10 +415,29 @@ fn bare_char(c: char) -> bool {
         || matches!(c, '_' | '-' | '.' | '/' | '=' | ':' | ',' | '%' | '@' | '+')
 }
 
+/// Shell-quote a remote path, rewriting a leading `~` or `~/` into an unquoted
+/// `$HOME` prefix: once quoted, bash performs no tilde expansion, so `~/x`
+/// would address a literal `~` directory. Other leading tildes (`~user/x`)
+/// stay quoted literals.
+#[must_use]
+pub fn quote_remote_path(remote: &str) -> String {
+    if let Some(tail) = remote
+        .strip_prefix('~')
+        .and_then(|rest| rest.strip_prefix('/'))
+        && !tail.is_empty()
+    {
+        return format!("$HOME/{}", shell_quote(tail));
+    }
+    match remote {
+        "~" | "~/" => "$HOME".to_owned(),
+        _ => shell_quote(remote),
+    }
+}
+
 /// Request that streams forwarded stdin into a remote file (`cat >`,
-/// truncates) in the given session. The remote `cat` writes no stdout; its
-/// stderr and exit code carry any failure (missing parent directory,
-/// permissions).
+/// truncates) in the given session; a leading `~` in `remote` expands to the
+/// remote home. The remote `cat` writes no stdout; its stderr and exit code
+/// carry any failure (missing parent directory, permissions).
 #[must_use]
 pub fn upload_request(
     host: String,
@@ -429,7 +448,7 @@ pub fn upload_request(
 ) -> ExecRequest {
     ExecRequest {
         host,
-        command: format!("cat > {}", shell_quote(remote)),
+        command: format!("cat > {}", quote_remote_path(remote)),
         args: Vec::new(),
         cwd,
         state: None,
@@ -439,7 +458,8 @@ pub fn upload_request(
 }
 
 /// Request that streams a remote file (relative paths resolve against the
-/// session's persisted cwd) to captured stdout (`cat`).
+/// session's persisted cwd, a leading `~` expands to the remote home) to
+/// captured stdout (`cat`).
 #[must_use]
 pub fn download_request(
     host: String,
@@ -450,7 +470,7 @@ pub fn download_request(
 ) -> ExecRequest {
     ExecRequest {
         host,
-        command: format!("cat {}", shell_quote(remote)),
+        command: format!("cat {}", quote_remote_path(remote)),
         args: Vec::new(),
         cwd,
         state: None,
@@ -461,7 +481,7 @@ pub fn download_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{append_capped, is_bare_word, shell_quote};
+    use super::{append_capped, is_bare_word, quote_remote_path, shell_quote};
 
     #[test]
     fn append_capped_keeps_prefix_and_counts_the_rest() {
@@ -499,5 +519,26 @@ mod tests {
         assert!(!is_bare_word("a|b"));
         // A quoted command line always fails the bare test and is run verbatim.
         assert!(!is_bare_word("cd /tmp && pwd"));
+    }
+
+    #[test]
+    fn remote_paths_expand_leading_tilde() {
+        assert_eq!(quote_remote_path("~"), "$HOME");
+        assert_eq!(quote_remote_path("~/"), "$HOME");
+        assert_eq!(quote_remote_path("~/x"), "$HOME/x");
+        assert_eq!(quote_remote_path("~/a/b.txt"), "$HOME/a/b.txt");
+        // The tail is still quoted when it needs it; $HOME stays outside.
+        assert_eq!(quote_remote_path("~/a b"), "$HOME/'a b'");
+        assert_eq!(quote_remote_path("~/it's"), "$HOME/'it'\\''s'");
+    }
+
+    #[test]
+    fn remote_paths_leave_other_tildes_quoted() {
+        // ~user is another user's home, not sp's to resolve.
+        assert_eq!(quote_remote_path("~user/x"), "'~user/x'");
+        assert_eq!(quote_remote_path("~x"), "'~x'");
+        // Inner tildes are literal path characters.
+        assert_eq!(quote_remote_path("/root/~/x"), "'/root/~/x'");
+        assert_eq!(quote_remote_path(""), "''");
     }
 }
