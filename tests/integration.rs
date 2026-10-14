@@ -300,11 +300,13 @@ async fn binary_output_is_byte_exact() {
 #[tokio::test]
 async fn large_output_streams() {
     let Some(_g) = guard().await else { return };
-    let (rep, out, _) = run("seq 1 100000", None, None).await.unwrap();
+    // 80000 lines = ~469KB: near the client-side capture cap (512KB/stream),
+    // but under it, so the full-passthrough assertions stay meaningful.
+    let (rep, out, _) = run("seq 1 80000", None, None).await.unwrap();
     assert_eq!(rep.code, 0);
     let text = out_str(&out);
-    assert_eq!(text.lines().count(), 100_000);
-    assert!(text.ends_with("100000\n"));
+    assert_eq!(text.lines().count(), 80_000);
+    assert!(text.ends_with("80000\n"));
 }
 
 #[tokio::test]
