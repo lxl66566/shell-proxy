@@ -26,8 +26,8 @@ pub struct ResolvedHost {
     /// `connecttimeout` seconds (0/unset = library default); bounds the TCP
     /// connect and the shared handshake + authentication budget.
     pub connect_timeout: Option<Duration>,
-    /// `stricthostkeychecking` value: unknown keys are rejected unless this
-    /// is `no`/`off`/`accept-new`.
+    /// `stricthostkeychecking` value: unknown keys are rejected unless it
+    /// canonicalizes to `no`/`off`/`false`/`accept-new`.
     pub strict_host_keys: bool,
     /// `hostkeyalias`: known_hosts entries are recorded under this name
     /// instead of the hostname.
@@ -170,7 +170,12 @@ fn parse_ssh_g_output(host: &str, text: &str) -> Result<ResolvedHost> {
                     .map(PathBuf::from),
             ),
             "stricthostkeychecking" => {
-                strict_host_keys = !matches!(unquote(value).as_str(), "no" | "off" | "accept-new");
+                // OpenSSH canonicalizes booleans in `ssh -G` output to
+                // true/false; "yes"/"no" come from older releases.
+                strict_host_keys = !matches!(
+                    unquote(value).as_str(),
+                    "no" | "off" | "false" | "accept-new"
+                );
             },
             "proxycommand" => {
                 let v = unquote(value);
@@ -453,6 +458,26 @@ identityfile \"C:/a b/id_ed25519\"
             parse_ssh_g_output("x", &mk("none")).unwrap().host_key_alias,
             None
         );
+    }
+
+    #[test]
+    fn parse_stricthostkeychecking() {
+        let mk = |v: &str| format!("host x\nhostname h\nstricthostkeychecking {v}\n");
+        let non_strict = ["no", "off", "false", "accept-new", "\"false\""];
+        for v in non_strict {
+            assert!(
+                !parse_ssh_g_output("x", &mk(v)).unwrap().strict_host_keys,
+                "{v} must not be strict"
+            );
+        }
+        // true is OpenSSH's canonical form of yes; ask is the default; an
+        // unrecognized value fails closed.
+        for v in ["true", "yes", "ask", "other"] {
+            assert!(
+                parse_ssh_g_output("x", &mk(v)).unwrap().strict_host_keys,
+                "{v} must be strict"
+            );
+        }
     }
 
     #[test]
