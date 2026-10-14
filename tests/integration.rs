@@ -57,6 +57,16 @@ fn harness() -> &'static Harness {
             std::env::set_var(config::ENV_DAEMON_EXE, env!("CARGO_BIN_EXE_sp"));
         }
 
+        // `ssh -G` emits drive-relative known_hosts paths on Windows (the
+        // global "/etc/ssh/ssh_known_hosts" resolves against the current
+        // drive). When SP_TEST_CWD names a directory on the intended drive,
+        // run the daemon from there so those paths resolve under it.
+        if cfg!(windows)
+            && let Some(dir) = std::env::var_os("SP_TEST_CWD")
+        {
+            std::env::set_current_dir(&dir).expect("SP_TEST_CWD must be a directory");
+        }
+
         client::spawn_daemon().expect("spawn daemon");
 
         Harness {
@@ -147,6 +157,48 @@ async fn run_in(
 /// Unique session name for a test (charset matches SessionId validation).
 fn unique_session(tag: &str) -> String {
     format!("t-{tag}-{}", std::process::id())
+}
+
+/// Spawn `command` in `session`, forward `sig` after a short lead, and await
+/// the report - the interactive Ctrl+C flow.
+async fn run_and_signal(
+    session: Option<&str>,
+    command: &str,
+    sig: Signal,
+) -> shell_proxy::Result<(RunReport, Vec<u8>, Vec<u8>)> {
+    let req = ExecRequest {
+        host: harness().host.clone(),
+        command: command.to_owned(),
+        args: Vec::new(),
+        cwd: None,
+        state: None,
+        timeout_ms: None,
+        session: session.map(str::to_owned),
+    };
+    let (tx, rx) = mpsc::channel(1);
+    let spawned = tokio::spawn(client::run_captured(req, Vec::new(), rx));
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    tx.send(sig).await.unwrap();
+    spawned.await.unwrap()
+}
+
+/// Like [`run`] but feeds `stdin` bytes to the command.
+async fn run_stdin(
+    command: &str,
+    stdin: Vec<u8>,
+    timeout_ms: Option<u64>,
+) -> shell_proxy::Result<(RunReport, Vec<u8>, Vec<u8>)> {
+    let req = ExecRequest {
+        host: harness().host.clone(),
+        command: command.to_owned(),
+        args: Vec::new(),
+        cwd: None,
+        state: None,
+        timeout_ms,
+        session: None,
+    };
+    let (_tx, rx) = mpsc::channel(1);
+    client::run_captured(req, stdin, rx).await
 }
 
 fn out_str(v: &[u8]) -> String {
@@ -282,6 +334,35 @@ async fn stdin_forwarding() {
     assert_eq!(out_str(&out), "line-one\nline-two\n");
 }
 
+/// 8 MiB of stdin into a command that never reads: backpressure must park the
+/// pipeline, and the command's exit must tear it down instead of wedging.
+#[tokio::test]
+async fn stdin_backpressure_does_not_wedge_host() {
+    let Some(_g) = guard().await else { return };
+    let pattern = b"sp-backpressure-block";
+    let mut stdin = pattern.repeat(8 * 1024 * 1024 / pattern.len() + 1);
+    stdin.truncate(8 * 1024 * 1024);
+    let started = Instant::now();
+    let (rep, ..) =
+        tokio::time::timeout(Duration::from_secs(20), run_stdin("sleep 3", stdin, None))
+            .await
+            .expect("unread stdin must not wedge the exec")
+            .unwrap();
+    assert_eq!(rep.code, 0);
+    assert!(started.elapsed() < Duration::from_secs(20));
+}
+
+/// 8 MiB of stdin must arrive intact end to end - no silently dropped
+/// mid-stream frames.
+#[tokio::test]
+async fn stdin_large_transfer_is_intact() {
+    let Some(_g) = guard().await else { return };
+    let stdin = b"0123456789abcdef".repeat(8 * 1024 * 1024 / 16);
+    let (rep, out, _) = run_stdin("wc -c", stdin, Some(30_000)).await.unwrap();
+    assert_eq!(rep.code, 0);
+    assert_eq!(out_str(&out).trim(), "8388608");
+}
+
 #[tokio::test]
 async fn cwd_persists_across_calls() {
     let Some(_g) = guard().await else { return };
@@ -359,6 +440,106 @@ async fn state_updates_take_latest_value() {
     assert_eq!(out_str(&out), "[]\n");
 }
 
+/// State values needing quoting on dump must round-trip byte-exactly.
+#[tokio::test]
+async fn state_dump_escapes_roundtrip() {
+    let Some(_g) = guard().await else { return };
+    let s = unique_session("esc");
+    run_in(&s, r#"export SP_ESC="a'b\"c$(echo d)""#, None, None)
+        .await
+        .unwrap();
+    run_in(&s, r"SP_NL=$'l1\nl2'", None, None).await.unwrap();
+    run_in(&s, "sp_q() { echo \"x'y $(pwd)\"; }", None, None)
+        .await
+        .unwrap();
+    let (rep, out, _) = run_in(&s, "printf '%s' \"$SP_ESC\"", None, None)
+        .await
+        .unwrap();
+    assert_eq!(rep.code, 0);
+    assert_eq!(out_str(&out), "a'b\"cd");
+    let (rep, out, _) = run_in(&s, "printf '%s' \"${SP_NL}\"", None, None)
+        .await
+        .unwrap();
+    assert_eq!(rep.code, 0);
+    assert_eq!(out_str(&out), "l1\nl2");
+    let (rep, out, _) = run_in(&s, "sp_q ok", None, None).await.unwrap();
+    assert_eq!(rep.code, 0);
+    assert!(
+        out_str(&out).starts_with("x'y /"),
+        "quoted fn body must survive the dump: {}",
+        out_str(&out)
+    );
+}
+
+/// Positional args ($1..) must reach the command with boundaries intact.
+#[tokio::test]
+async fn positional_args_reach_command() {
+    let Some(_g) = guard().await else { return };
+    let req = ExecRequest {
+        host: harness().host.clone(),
+        command: r#"printf '%s|%s\n' "$1" "$2""#.into(),
+        args: vec!["a b".into(), "c".into()],
+        cwd: None,
+        state: None,
+        timeout_ms: None,
+        session: None,
+    };
+    let (_tx, rx) = mpsc::channel(1);
+    let (rep, out, _) = client::run_captured(req, Vec::new(), rx).await.unwrap();
+    assert_eq!(rep.code, 0);
+    assert_eq!(out_str(&out), "a b|c\n");
+}
+
+/// errexit set by the user must persist across calls.
+#[tokio::test]
+async fn errexit_persists_across_calls() {
+    let Some(_g) = guard().await else { return };
+    let s = unique_session("errexit");
+    run_in(&s, "set -e", None, None).await.unwrap();
+    let (_, out, _) = run_in(
+        &s,
+        "case $- in *e*) echo on;; *) echo off;; esac",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(out_str(&out).trim(), "on");
+    // Behavioral anchor: a failing command aborts the script.
+    let (rep, out, _) = run_in(&s, "echo before; false; echo after", None, None)
+        .await
+        .unwrap();
+    assert_eq!(rep.code, 1);
+    assert_eq!(out_str(&out).trim(), "before");
+    run_in(&s, "set +e", None, None).await.unwrap();
+}
+
+/// A state dump exceeding the 256 KiB cap is dropped: the oversized variable
+/// disappears and the previous state stays intact.
+#[tokio::test]
+async fn oversized_state_keeps_previous() {
+    let Some(_g) = guard().await else { return };
+    let s = unique_session("big-state");
+    run_in(&s, "export SP_KEEP=1", None, None).await.unwrap();
+    let (rep, ..) = run_in(
+        &s,
+        "export SP_BIG=$(head -c 300000 /dev/zero | tr '\\0' x)",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rep.code, 0);
+    let (_, out, _) = run_in(&s, "echo \"[$SP_BIG][$SP_KEEP]\"", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        out_str(&out).trim(),
+        "[][1]",
+        "oversized dump must be dropped, previous state kept"
+    );
+}
+
 #[tokio::test]
 async fn timeout_kills_command() {
     let Some(_g) = guard().await else { return };
@@ -367,6 +548,88 @@ async fn timeout_kills_command() {
     assert!(rep.timed_out, "expected timeout");
     assert_eq!(rep.code, 124);
     assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+/// A TERM-immune group member must be reaped by the KILL escalation, not left
+/// behind as an orphan when the leader dies inside the TERM grace.
+#[tokio::test]
+async fn timeout_escalates_kill_to_term_immune_group() {
+    let Some(_g) = guard().await else { return };
+    // Unique duration (101) so pgrep/pkill cannot match other tests' sleeps.
+    let started = Instant::now();
+    let (rep, ..) = run(
+        "sh -c \"trap '' TERM; exec sleep 101\" & sleep 60",
+        None,
+        Some(1500),
+    )
+    .await
+    .unwrap();
+    assert!(rep.timed_out, "expected timeout");
+    assert_eq!(rep.code, 124);
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "TERM grace is 5s; the KILL escalation must return well before 15s"
+    );
+    // The KILL is delivered before the exit report is written; poll only to
+    // absorb process-table update jitter on the remote.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, out, _) = run("pgrep -f 'sleep 101' | wc -l", None, None)
+            .await
+            .unwrap();
+        if out_str(&out).trim() == "0" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "TERM-immune orphan must be SIGKILLed after the grace"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// A timeout that fires while the command blocks reading stdin (no data, no
+/// EOF) must still return 124 within the bounded teardown, not wedge.
+#[tokio::test]
+async fn timeout_while_reading_stdin() {
+    let Some(_g) = guard().await else { return };
+    let req = ExecRequest {
+        host: harness().host.clone(),
+        command: "cat".into(),
+        args: vec![],
+        cwd: None,
+        state: None,
+        timeout_ms: Some(1500),
+        session: None,
+    };
+    let (_tx, rx) = mpsc::channel(1);
+    // A stdin that never yields data or EOF keeps `cat` blocked in read, so
+    // only the timeout watchdog can end the exec.
+    let io = client::RunIo {
+        stdin: Box::new(PendingStdin),
+        stdout: Box::new(tokio::io::sink()),
+        stderr: Box::new(tokio::io::sink()),
+    };
+    let started = Instant::now();
+    let rep = client::run(req, io, rx).await.unwrap();
+    assert!(rep.timed_out, "expected timeout");
+    assert_eq!(rep.code, 124);
+    // The still-open stdin lane is torn down by a bounded join (~10s) after
+    // the exec ends; the run must stay bounded, never hang.
+    assert!(started.elapsed() < Duration::from_secs(20));
+}
+
+/// A stdin reader that stays Pending forever: no data, no EOF.
+struct PendingStdin;
+
+impl tokio::io::AsyncRead for PendingStdin {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
 }
 
 /// A detached job (own session via setsid, so serve's group kill cannot reach
@@ -407,6 +670,34 @@ async fn orphan_holding_pipes_does_not_wedge_the_host() {
     assert_eq!(rep2.code, 0);
     assert_eq!(out_str(&out2).trim(), "alive");
     assert!(t.elapsed() < Duration::from_secs(10));
+}
+
+/// A plain background job (no setsid, no redirection) keeps the session's
+/// stdout write end open: the exit report must still arrive within the bounded
+/// drain, and the group kill at command end reaps the job.
+#[tokio::test]
+async fn orphan_holding_stdout_does_not_wedge() {
+    let Some(_g) = guard().await else { return };
+    let started = Instant::now();
+    let res = tokio::time::timeout(
+        Duration::from_secs(30),
+        run("sh -c 'exec sleep 102' & echo ok", None, None),
+    )
+    .await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(15),
+        run("pkill -f 'sleep 102' 2>/dev/null; true", None, None),
+    )
+    .await;
+    let (rep, out, _) = res
+        .expect("exec must finish while the orphan lives")
+        .unwrap();
+    assert_eq!(rep.code, 0);
+    assert_eq!(out_str(&out).trim(), "ok");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "orphan-held stdout must not stall the exit report"
+    );
 }
 
 /// cd and exported state must persist even when a surviving background job
@@ -450,23 +741,89 @@ async fn state_persists_with_surviving_background_job() {
 #[tokio::test]
 async fn sigint_forwards_to_remote() {
     let Some(_g) = guard().await else { return };
-    let req = ExecRequest {
-        host: harness().host.clone(),
-        command: "sleep 60".into(),
-        args: vec![],
-        cwd: None,
-        state: None,
-        timeout_ms: None,
-        session: None,
-    };
-    let (tx, rx) = mpsc::channel(1);
-    let spawned = tokio::spawn(client::run_captured(req, Vec::new(), rx));
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    tx.send(Signal::Int).await.unwrap();
     let started = Instant::now();
-    let (rep, ..) = spawned.await.unwrap().unwrap();
+    let (rep, ..) = run_and_signal(None, "sleep 60", Signal::Int).await.unwrap();
     assert_eq!(rep.code, 130, "SIGINT should surface as 130");
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+// The out-of-band TERM/HUP channel request tears down the exec channel on the
+// test sshd: serve reports a closed transport and the client gets 254 instead
+// of the forwarded 143/129. Kept as the contract for the fix; unignore then.
+#[ignore = "out-of-band TERM/HUP closes the exec channel (client gets 254, not 143/129)"]
+#[tokio::test]
+async fn sigterm_forwards_to_remote() {
+    let Some(_g) = guard().await else { return };
+    let started = Instant::now();
+    let (rep, ..) = run_and_signal(None, "sleep 60", Signal::Term)
+        .await
+        .unwrap();
+    assert_eq!(rep.code, 143, "SIGTERM should surface as 143");
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+// See sigterm_forwards_to_remote.
+#[ignore = "out-of-band TERM/HUP closes the exec channel (client gets 254, not 129)"]
+#[tokio::test]
+async fn sighup_forwards_to_remote() {
+    let Some(_g) = guard().await else { return };
+    let started = Instant::now();
+    let (rep, ..) = run_and_signal(None, "sleep 60", Signal::Hup).await.unwrap();
+    assert_eq!(rep.code, 129, "SIGHUP should surface as 129");
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// Kill travels in-band only (an uncatchable out-of-band request would end
+/// serve itself and lose the exit report): serve survives, reaps the group and
+/// reports the wrapper's 128+9.
+#[tokio::test]
+async fn sigkill_forwards_to_remote() {
+    let Some(_g) = guard().await else { return };
+    let started = Instant::now();
+    let (rep, ..) = run_and_signal(None, "sleep 60", Signal::Kill)
+        .await
+        .unwrap();
+    assert_eq!(rep.code, 137, "SIGKILL should surface as 137");
+    assert!(rep.error.is_none(), "the exit report must survive");
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// cwd and state updates of a signal-interrupted command must persist: the
+/// wrapper epilogue runs despite the interruption.
+#[tokio::test]
+async fn interruption_keeps_cwd_and_state() {
+    let Some(_g) = guard().await else { return };
+    let s = unique_session("sig-keep");
+    let (rep, ..) = run_and_signal(
+        Some(&s),
+        "cd /tmp; export SP_SIG_MARK=1; sleep 60",
+        Signal::Int,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rep.code, 130, "SIGINT should surface as 130");
+    assert_eq!(rep.cwd.as_deref(), Some("/tmp"));
+    let (_, out, _) = run_in(&s, "pwd; echo [$SP_SIG_MARK]", None, None)
+        .await
+        .unwrap();
+    let text = out_str(&out);
+    assert!(text.contains("/tmp"), "cwd must persist: {text}");
+    assert!(text.contains("[1]"), "exported var must persist: {text}");
+}
+
+/// The timeout path also persists the interrupted command's cwd updates.
+#[tokio::test]
+async fn timeout_keeps_cwd() {
+    let Some(_g) = guard().await else { return };
+    let s = unique_session("tmo-cwd");
+    let (rep, ..) = run_in(&s, "cd /tmp; sleep 60", None, Some(1500))
+        .await
+        .unwrap();
+    assert!(rep.timed_out, "expected timeout");
+    assert_eq!(rep.code, 124);
+    assert_eq!(rep.cwd.as_deref(), Some("/tmp"));
+    let (_, out, _) = run_in(&s, "pwd", None, None).await.unwrap();
+    assert_eq!(out_str(&out).trim(), "/tmp");
 }
 
 #[tokio::test]
@@ -482,24 +839,21 @@ async fn exec_replacement_still_reports_rc() {
 #[tokio::test]
 async fn serve_binary_is_deployed() {
     let Some(_g) = guard().await else { return };
+    // Assert the exact current version, not a file count: leftover binaries
+    // of other versions or a concurrent daemon deploying in parallel (nextest
+    // runs one process per test) would make counting flaky.
     let (rep, out, _) = run(
-        "ls ~/.local/share/shell-proxy/sp-serve-*-* | wc -l",
+        &format!(
+            "test -x ~/.local/share/shell-proxy/sp-serve-{}-* && echo executable",
+            env!("CARGO_PKG_VERSION")
+        ),
         None,
         None,
     )
     .await
     .unwrap();
-    assert_eq!(rep.code, 0);
-    assert_eq!(out_str(&out).trim(), "1", "exactly one sp-serve binary");
-    let (rep2, out2, _) = run(
-        "test -x ~/.local/share/shell-proxy/sp-serve-*-* && echo executable",
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(rep2.code, 0);
-    assert_eq!(out_str(&out2).trim(), "executable");
+    assert_eq!(rep.code, 0, "current-version sp-serve must be deployed");
+    assert_eq!(out_str(&out).trim(), "executable");
 }
 
 #[tokio::test]
@@ -550,6 +904,22 @@ async fn cli_quoted_line_runs_as_command_line() {
         .expect("run sp");
     assert_eq!(out.status.code(), Some(0), "{}", out_str(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "333\n");
+}
+
+/// `--timeout` beyond the 24 h bound is rejected at argument parsing, before
+/// any daemon or host contact; no guard needed for a pure CLI failure.
+#[tokio::test]
+async fn cli_rejects_huge_timeout() {
+    let out = Command::new(env!("CARGO_BIN_EXE_sp"))
+        .args(["--timeout", "99999999999999999", "--host", "ls", "true"])
+        .output()
+        .expect("run sp");
+    assert_eq!(out.status.code(), Some(2));
+    let err = out_str(&out.stderr);
+    assert!(
+        err.contains("exceeds the maximum"),
+        "expected a timeout bound error: {err}"
+    );
 }
 
 #[tokio::test]
