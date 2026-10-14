@@ -3,9 +3,9 @@
 //! serve is stateless and handles exactly one execution, then exits 0. Its own
 //! stderr (diagnostics) travels as SSH extended data and lands in the daemon
 //! log; only frames go to stdout. Signals arrive two ways: in-band `Signal`
-//! frames on stdin (compatibility path, delivery not guaranteed once stdin
-//! backpressure stalls) and out of band as SSH channel requests that sshd
-//! delivers to the process itself (see [`Signals`]).
+//! frames on stdin (the delivery path for Term, Hup and Kill - delayed while
+//! stdin backpressure stalls) and, for interrupts, out of band as SSH channel
+//! requests that sshd delivers to this process's group (see [`Signals`]).
 
 use std::time::Duration;
 
@@ -173,12 +173,13 @@ async fn execute(
     // child stops reading, this send blocks, the SSH stdin window closes and
     // the producer on the client side blocks - backpressure end to end
     // instead of dropped data or unbounded buffering. A stalled stdin stream
-    // therefore delays every in-band frame, Signal included, so signals
-    // travel out of band instead: the daemon sends them as SSH channel
-    // requests, sshd delivers them straight to this process whatever the
-    // stdin window state, and the handlers installed at startup feed them
-    // into the control path below. In-band Signal frames remain supported as
-    // a compatibility path, but their delivery is not guaranteed.
+    // therefore delays every in-band frame, Signal included, so interrupts
+    // travel out of band instead: the daemon sends Int as an SSH channel
+    // request, sshd delivers it to this process whatever the stdin window
+    // state, and the handlers installed at startup feed it into the control
+    // path below. Term, Hup and Kill stay on the in-band frame: out of band,
+    // sshd killpgs the session child's whole group, which kills a forking
+    // login shell (fish) on TERM/HUP and tears the channel down.
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Ctrl>(16);
     let ping_tx = out_tx.clone();
     let sig_tx = ctrl_tx.clone();
@@ -435,12 +436,14 @@ enum StdinMsg {
 /// Caught INT/TERM/HUP, installed before any command runs.
 ///
 /// The daemon sends interrupts out of band as SSH channel requests: sshd
-/// delivers them straight to this process, independent of the stdin window
+/// delivers them to this process's group, independent of the stdin window
 /// that end-to-end backpressure may have closed. Under the default
 /// dispositions serve itself would die and drop every report; forwarding the
 /// signal to the child's group instead keeps the bash-side trap -> epilogue ->
-/// report chain intact. SIGKILL is not catchable and remains the daemon-side
-/// last resort.
+/// report chain intact. The TERM and HUP handlers guard against a direct
+/// `kill <serve pid>` (an admin, the timeout tooling) with the same
+/// forwarding. SIGKILL is not catchable and remains the daemon-side last
+/// resort.
 struct Signals {
     int: tokio::signal::unix::Signal,
     term: tokio::signal::unix::Signal,

@@ -247,9 +247,10 @@ async fn cleanup_stale(handle: &SshHandle, keep: &str) -> Result<()> {
 /// channel write is cancellable against a latched shutdown flag (russh parks
 /// data writes on the send-window notifier and channel Close never wakes
 /// them, see the forwarder below), the final joins are time-bounded, and a
-/// dropped future aborts the tasks via [`EngineTasks`]. Signals travel out of
-/// band (all but Kill) from a dedicated sender task, so they are delivered
-/// even while stdin writes are parked on a full window.
+/// dropped future aborts the tasks via [`EngineTasks`]. Int travels out of
+/// band from a dedicated sender task, so it is delivered even while stdin
+/// writes are parked on a full window; every other signal rides the in-band
+/// frame (see [`goes_out_of_band`]).
 pub async fn execute(
     handle: &SshHandle,
     serve_path: &str,
@@ -315,11 +316,13 @@ pub async fn execute(
 
     // Out-of-band signal sender: consumes the signal lane and calls only
     // writer.signal() - an SSH channel request that consumes no stdin window
-    // and writes no data frame. A dedicated task keeps this path alive while
+    // and writes no data frame - for the signals that may use it (Int only,
+    // see [`goes_out_of_band`]). A dedicated task keeps this path alive while
     // the forwarder is parked inside a data write on a full window, which is
     // precisely when an interrupt must get through (the forwarder cannot
-    // serve the signal lane from inside that park). Each signal is then
-    // relayed to the forwarder's in-band lane for the compatibility frame.
+    // serve the signal lane from inside that park). Every signal is then
+    // relayed to the forwarder's in-band lane; for Term, Hup and Kill that
+    // frame is the actual delivery.
     let (inband_tx, mut inband_rx) = mpsc::channel::<Signal>(8);
     let sig_writer = Arc::clone(&writer);
     let mut sig_shutdown = shutdown_rx.clone();
@@ -340,10 +343,10 @@ pub async fn execute(
                     None => break,
                 }
             }
-            // In-band relay (compat path; the frame is ordered behind queued
-            // stdin data). Best-effort by design: a signal that went out of
-            // band is already delivered, so a drop here only loses its
-            // duplicate - except Kill, whose only delivery path this is.
+            // In-band delivery (the frame is ordered behind queued stdin
+            // data, so it waits out a full window). For Int this only
+            // duplicates the request above; for Term, Hup and Kill it is the
+            // sole path - a drop there loses the signal.
             if inband_tx.try_send(sig).is_err() {
                 if goes_out_of_band(sig) {
                     warn!(
@@ -353,8 +356,9 @@ pub async fn execute(
                     );
                 } else {
                     warn!(
-                        "in-band signal lane full, dropping Kill signal; it has no out-of-band \
-                         fallback"
+                        "in-band signal lane full, dropping {} signal; it has no out-of-band \
+                         fallback",
+                        sig.as_str()
                     );
                 }
             }
@@ -395,8 +399,10 @@ pub async fn execute(
             }
             tokio::select! {
                 biased;
-                // Signal frames first: control traffic may overtake queued
-                // stdin data (the request itself already went out of band).
+                // Signal frames first: for Term, Hup and Kill this frame is
+                // the delivery itself; for Int it only duplicates the
+                // out-of-band request, but letting it overtake queued stdin
+                // data keeps the latency down either way.
                 sig = inband_rx.recv() => {
                     if let Some(sig) = sig
                         && !send_signal_frame(&writer, &mut fwd_shutdown, sig).await
@@ -623,19 +629,30 @@ impl Drop for EngineTasks {
     }
 }
 
-/// Whether `sig` may travel as an out-of-band SSH channel request. Kill must
-/// not: sshd delivers channel signal requests to the serve process itself,
-/// not to the command's process group, and an uncatchable SIGKILL there kills
-/// serve before it can kill the group or report an exit (137). Kill travels
-/// in-band only, where serve does `kill_group(SIGKILL)` and still reports.
+/// Whether `sig` may travel as an out-of-band SSH channel request.
+///
+/// sshd delivers a channel signal request with `killpg` on the whole process
+/// group of the session child. When the remote login shell forks the serve
+/// process instead of exec'ing it (fish does), that group also contains the
+/// shell: TERM and HUP kill it under their default dispositions, and sshd then
+/// tears the exec channel down (child "exit") before serve can report - the
+/// client would see 254 instead of 143/129. Only Int is safe there: shells
+/// survive SIGINT while waiting on a foreground child. Kill must never go out
+/// of band either: it is uncatchable, would kill serve (and the login shell)
+/// outright, and no exit report could be sent. Term, Hup and Kill therefore
+/// ride the in-band frame, which reaches serve through the stdin window; while
+/// that window is saturated they can be delayed until the reader catches up -
+/// the same tradeoff Kill already makes. The out-of-band path exists for the
+/// interactive Ctrl+C case, where a wedged stdin window must not block the
+/// interrupt.
 fn goes_out_of_band(sig: Signal) -> bool {
-    sig != Signal::Kill
+    matches!(sig, Signal::Int)
 }
 
 /// Send one in-band Signal frame, best-effort; returns false when the caller's
-/// loop must stop (shutdown fired or the transport is dead). The frame is the
-/// compatibility path - the out-of-band request (sent by the signal sender
-/// task, except for Kill) is what actually carries the signal.
+/// loop must stop (shutdown fired or the transport is dead). This frame is the
+/// delivery path for Term, Hup and Kill; for Int it duplicates the out-of-band
+/// request the signal sender task already issued.
 async fn send_signal_frame(
     writer: &russh::ChannelWriteHalf<russh::client::Msg>,
     shutdown: &mut watch::Receiver<bool>,
@@ -833,12 +850,14 @@ mod tests {
     }
 
     #[test]
-    fn only_kill_is_gated_off_the_out_of_band_path() {
-        // Out of band, sshd hands the request to serve itself; an
-        // uncatchable Kill would end serve without an exit report.
+    fn only_int_travels_out_of_band() {
+        // Out of band, sshd killpgs the session child's whole group: Term and
+        // Hup would kill a forking login shell (fish) and tear the channel
+        // down, and an uncatchable Kill would end serve itself - either way
+        // the exit report is lost. Those signals ride the in-band frame.
         assert!(goes_out_of_band(Signal::Int));
-        assert!(goes_out_of_band(Signal::Term));
-        assert!(goes_out_of_band(Signal::Hup));
+        assert!(!goes_out_of_band(Signal::Term));
+        assert!(!goes_out_of_band(Signal::Hup));
         assert!(!goes_out_of_band(Signal::Kill));
     }
 

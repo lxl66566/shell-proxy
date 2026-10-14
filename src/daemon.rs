@@ -484,9 +484,9 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
                             info!("forwarding signal {} to engine", s.as_str());
                             // Small lane, drained promptly by the engine's
                             // forwarder; beyond it a signal drops with a warn
-                            // (every signal also travels out of band). A
-                            // closed lane means the engine is already
-                            // finishing - nothing left to deliver to.
+                            // (Int also travels out of band). A closed lane
+                            // means the engine is already finishing - nothing
+                            // left to deliver to.
                             if let Err(mpsc::error::TrySendError::Full(_)) = sig_tx.try_send(s) {
                                 warn!("signal lane full, dropping {} signal", s.as_str());
                             }

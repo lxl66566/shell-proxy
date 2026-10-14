@@ -747,10 +747,9 @@ async fn sigint_forwards_to_remote() {
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
-// The out-of-band TERM/HUP channel request tears down the exec channel on the
-// test sshd: serve reports a closed transport and the client gets 254 instead
-// of the forwarded 143/129. Kept as the contract for the fix; unignore then.
-#[ignore = "out-of-band TERM/HUP closes the exec channel (client gets 254, not 143/129)"]
+/// Term and Hup ride the in-band frame only: out of band, sshd killpgs the
+/// session child's whole group, which kills the forking login shell (fish on
+/// this host) and tears the exec channel down before serve can report.
 #[tokio::test]
 async fn sigterm_forwards_to_remote() {
     let Some(_g) = guard().await else { return };
@@ -762,8 +761,7 @@ async fn sigterm_forwards_to_remote() {
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
-// See sigterm_forwards_to_remote.
-#[ignore = "out-of-band TERM/HUP closes the exec channel (client gets 254, not 129)"]
+/// See sigterm_forwards_to_remote.
 #[tokio::test]
 async fn sighup_forwards_to_remote() {
     let Some(_g) = guard().await else { return };
