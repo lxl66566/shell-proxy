@@ -9,7 +9,7 @@ use base64::{
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
@@ -319,8 +319,8 @@ fn file_result(
 #[allow(clippy::unused_async_trait_impl)]
 #[tool_handler]
 impl ServerHandler for SpMcp {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         let mut imp = rmcp::model::Implementation::default();
         imp.name = env!("CARGO_PKG_NAME").into();
         imp.version = env!("CARGO_PKG_VERSION").into();
