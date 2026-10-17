@@ -2,6 +2,7 @@
 //! instead of dying, so the exit code of the interrupted remote command is
 //! still reported.
 
+#[cfg(windows)]
 use spdlog::prelude::*;
 use tokio::sync::mpsc;
 

@@ -96,9 +96,12 @@ pub fn sock_path() -> String {
     {
         return p;
     }
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
         windows_pipe_name()
-    } else {
+    }
+    #[cfg(not(windows))]
+    {
         app_dir().join("daemon.sock").to_string_lossy().into_owned()
     }
 }
