@@ -29,7 +29,7 @@ use tokio::{
 use crate::{
     config,
     error::{Error, Result},
-    remote::{self, ExecOutcome, OutputEvent, StdinEvent},
+    remote::{self, ExecChannel, ExecOutcome, OutputEvent, StdinEvent},
     session::{self, SessionId},
     ssh::{self, SshConnection},
     ssh_config,
@@ -46,7 +46,7 @@ const ROTATE_FILES: usize = 3;
 /// exit report: covers serve's TERM-to-KILL escalation, its bounded pipe
 /// drains and frame latency, so only a genuinely wedged serve (or transport)
 /// trips the watchdog. Dropping the engine then aborts its channel tasks
-/// (remote::execute keeps them behind a drop guard) and closes the channel
+/// (ExecChannel keeps them behind a drop guard) and closes the channel
 /// best-effort, which makes the remote side kill the process group and frees
 /// the host lock.
 const WATCHDOG_GRACE: Duration = Duration::from_secs(15);
@@ -444,10 +444,10 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
         // Scoped so the engine future is dropped before the frame reader and
         // bridge are joined below: the bridge ends only once the engine's
         // event sender is gone, and dropping the engine aborts its channel
-        // tasks and closes the exec channel best-effort (remote::execute
-        // keeps them behind a drop guard), letting the remote side clean up
+        // tasks and closes the exec channel best-effort (ExecChannel keeps
+        // them behind a drop guard), letting the remote side clean up
         // when we abandon the execution.
-        let mut engine = std::pin::pin!(remote::execute(
+        let open = ExecChannel::open(
             conn.conn.handle(),
             &conn.serve_path,
             &req.host,
@@ -455,7 +455,8 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
             stdin_rx,
             sig_rx,
             event_tx,
-        ));
+        );
+        let mut engine = std::pin::pin!(async { open.await?.wait().await });
 
         let mut ctrl_open = true;
         // Watchdog: serve enforces timeout_ms itself (TERM then KILL) and its
