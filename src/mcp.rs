@@ -134,7 +134,6 @@ impl SpMcp {
             command: params.0.command,
             args: Vec::new(),
             cwd: params.0.cwd,
-            state: None,
             timeout_ms: Some(timeout_ms),
             session: Some(session.as_str().to_owned()),
         };

@@ -10,7 +10,7 @@ use std::{sync::Arc, time::Duration};
 
 use russh::ChannelMsg;
 use sha2::{Digest, Sha256};
-use sp_proto::{EventDecoder, EventFrame, ExecFrame, ExecRequest, ExitReport, Signal};
+use sp_proto::{EventDecoder, EventFrame, ExecFrame, ExitReport, ServeExec, Signal};
 use spdlog::prelude::*;
 use tokio::{
     sync::{mpsc, watch},
@@ -254,25 +254,26 @@ async fn cleanup_stale(handle: &SshHandle, keep: &str) -> Result<()> {
 pub async fn execute(
     handle: &SshHandle,
     serve_path: &str,
-    req: &ExecRequest,
+    host: &str,
+    req: &ServeExec,
     mut stdin: mpsc::Receiver<StdinEvent>,
     mut signals: mpsc::Receiver<Signal>,
     output: mpsc::Sender<OutputEvent>,
 ) -> Result<ExecOutcome> {
     let channel = timeout(EXEC_SETUP_TIMEOUT, handle.channel_open_session())
         .await
-        .map_err(|_| exec_setup_timeout("open exec channel", &req.host))?
+        .map_err(|_| exec_setup_timeout("open exec channel", host))?
         .map_err(|e| Error::Remote(format!("open exec channel: {e}")))?;
     timeout(EXEC_SETUP_TIMEOUT, channel.exec(false, serve_path))
         .await
-        .map_err(|_| exec_setup_timeout("exec request", &req.host))?
+        .map_err(|_| exec_setup_timeout("exec request", host))?
         .map_err(|e| Error::Remote(format!("request exec {serve_path}: {e}")))?;
     let (mut reader, writer) = channel.split();
 
     let exec_frame = sp_proto::encode_exec_frame(&ExecFrame::Exec(req.clone()))?;
     timeout(EXEC_SETUP_TIMEOUT, writer.data_bytes(exec_frame))
         .await
-        .map_err(|_| exec_setup_timeout("send Exec frame", &req.host))?
+        .map_err(|_| exec_setup_timeout("send Exec frame", host))?
         .map_err(|e| Error::Remote(format!("send Exec frame: {e}")))?;
 
     let (shutdown, shutdown_rx) = Shutdown::new();
@@ -684,7 +685,7 @@ fn russh_sig(sig: Signal) -> russh::Sig {
 
 async fn send_frame(
     writer: &russh::ChannelWriteHalf<russh::client::Msg>,
-    frame: &ExecFrame,
+    frame: &ExecFrame<ServeExec>,
 ) -> Result<()> {
     writer
         .data_bytes(sp_proto::encode_exec_frame(frame)?)

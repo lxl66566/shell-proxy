@@ -125,7 +125,6 @@ async fn run(
         command: command.to_owned(),
         args: Vec::new(),
         cwd: cwd.map(str::to_owned),
-        state: None,
         timeout_ms,
         session: None,
     };
@@ -146,7 +145,6 @@ async fn run_in(
         command: command.to_owned(),
         args: Vec::new(),
         cwd: cwd.map(str::to_owned),
-        state: None,
         timeout_ms,
         session: Some(session.to_owned()),
     };
@@ -171,7 +169,6 @@ async fn run_and_signal(
         command: command.to_owned(),
         args: Vec::new(),
         cwd: None,
-        state: None,
         timeout_ms: None,
         session: session.map(str::to_owned),
     };
@@ -193,7 +190,6 @@ async fn run_stdin(
         command: command.to_owned(),
         args: Vec::new(),
         cwd: None,
-        state: None,
         timeout_ms,
         session: None,
     };
@@ -324,7 +320,6 @@ async fn stdin_forwarding() {
         command: "cat".into(),
         args: vec![],
         cwd: None,
-        state: None,
         timeout_ms: None,
         session: None,
     };
@@ -482,7 +477,6 @@ async fn positional_args_reach_command() {
         command: r#"printf '%s|%s\n' "$1" "$2""#.into(),
         args: vec!["a b".into(), "c".into()],
         cwd: None,
-        state: None,
         timeout_ms: None,
         session: None,
     };
@@ -600,7 +594,6 @@ async fn timeout_while_reading_stdin() {
         command: "cat".into(),
         args: vec![],
         cwd: None,
-        state: None,
         timeout_ms: Some(1500),
         session: None,
     };
@@ -866,7 +859,6 @@ async fn daemon_error_surfaces_in_report() {
         command: "true".into(),
         args: vec![],
         cwd: None,
-        state: None,
         timeout_ms: Some(10_000),
         session: None,
     };

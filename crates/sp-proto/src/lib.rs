@@ -7,8 +7,11 @@
 //! stream payloads are raw bytes. [`ExecFrame`] flows from the initiator,
 //! [`EventFrame`] flows back.
 
+pub mod session;
+
 use bytes::{Buf, BytesMut};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+pub use session::{DEFAULT_NAME, MAX_LEN, SessionId, SessionNameError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Protocol error.
@@ -84,12 +87,38 @@ impl Signal {
     }
 }
 
-/// Request for one remote execution.
+/// Request for one remote execution, client -> daemon hop (IPC). The daemon
+/// resolves the session and assembles the [`ServeExec`] it forwards to
+/// `sp-serve`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecRequest {
-    /// Host alias, resolved via the system ssh config by the daemon. Unused by
-    /// `sp-serve` (the daemon picks the host).
+    /// Host alias, resolved via the system ssh config by the daemon.
     pub host: String,
+    /// Command text, executed verbatim by bash.
+    pub command: String,
+    /// Positional arguments ($1..) for the command.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Starting cwd for this call; the daemon falls back to the session's
+    /// persisted cwd.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Kill the command after this many milliseconds; 0/None = unlimited.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Session name: the daemon routes persisted cwd by (host, session).
+    /// `None` means the default session.
+    #[serde(default)]
+    pub session: Option<String>,
+}
+
+/// Request for one remote execution, daemon -> `sp-serve` hop (SSH channel
+/// stdio). Fields the daemon already resolved (session, persisted cwd).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServeExec {
+    /// Session name, validated by the daemon; `sp-serve` re-validates it
+    /// before use.
+    pub session: String,
     /// Command text, executed verbatim by bash.
     pub command: String,
     /// Positional arguments ($1..) for the command.
@@ -106,10 +135,6 @@ pub struct ExecRequest {
     /// Kill the command after this many milliseconds; 0/None = unlimited.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
-    /// Session name: the daemon routes persisted cwd/state by (host, session).
-    /// `None` means the default session. Ignored by `sp-serve`.
-    #[serde(default)]
-    pub session: Option<String>,
 }
 
 /// Final report of one execution.
@@ -187,10 +212,12 @@ impl TryFrom<u8> for EventKind {
     }
 }
 
-/// One decoded initiator frame.
+/// One decoded initiator frame. `E` is the Exec payload type:
+/// [`ExecFrame<ExecRequest>`] on the IPC hop, [`ExecFrame<ServeExec>`] on the
+/// SSH hop.
 #[derive(Debug, Clone)]
-pub enum ExecFrame {
-    Exec(ExecRequest),
+pub enum ExecFrame<E = ExecRequest> {
+    Exec(E),
     StdinData(Vec<u8>),
     StdinEof,
     Signal(Signal),
@@ -213,8 +240,12 @@ const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 /// EOF is clean only at a frame boundary; a connection closed inside a header
 /// or payload surfaces as [`Error::Protocol`] instead of a bare io EOF, so a
 /// peer dying mid-frame is not mistaken for a normal shutdown.
-pub async fn read_exec_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<ExecFrame>> {
-    read_frame_as(r, ExecKind::try_from, decode_exec).await
+pub async fn read_exec_frame<R, E>(r: &mut R) -> Result<Option<ExecFrame<E>>>
+where
+    R: AsyncRead + Unpin,
+    E: DeserializeOwned,
+{
+    read_frame_as(r, ExecKind::try_from, decode_exec::<E>).await
 }
 
 /// Read one responder frame from a stream; `None` on clean EOF.
@@ -316,7 +347,7 @@ impl EventDecoder {
     }
 }
 
-fn decode_exec(kind: ExecKind, payload: Vec<u8>) -> Result<ExecFrame> {
+fn decode_exec<E: DeserializeOwned>(kind: ExecKind, payload: Vec<u8>) -> Result<ExecFrame<E>> {
     Ok(match kind {
         ExecKind::Exec => ExecFrame::Exec(json(&payload)?),
         ExecKind::StdinData => ExecFrame::StdinData(payload),
@@ -340,7 +371,7 @@ fn json<T: for<'de> Deserialize<'de>>(payload: &[u8]) -> Result<T> {
 }
 
 /// Encode one initiator frame to wire bytes.
-pub fn encode_exec_frame(frame: &ExecFrame) -> Result<Vec<u8>> {
+pub fn encode_exec_frame<E: Serialize>(frame: &ExecFrame<E>) -> Result<Vec<u8>> {
     let (kind, payload): (u8, Vec<u8>) = match frame {
         ExecFrame::Exec(req) => (ExecKind::Exec as u8, serde_json::to_vec(req)?),
         ExecFrame::StdinData(d) => (ExecKind::StdinData as u8, d.clone()),
@@ -391,7 +422,11 @@ const PACKED_PAYLOAD_MAX: usize = 8 * 1024;
 /// one buffer. This requires an exclusive writer per stream: the two writes
 /// must not interleave with another frame's. Every write path of this
 /// protocol is an exclusive task by design.
-pub async fn write_exec_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &ExecFrame) -> Result<()> {
+pub async fn write_exec_frame<W, E>(w: &mut W, frame: &ExecFrame<E>) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    E: Serialize,
+{
     match frame {
         ExecFrame::StdinData(d) if d.len() >= PACKED_PAYLOAD_MAX => {
             write_raw(w, ExecKind::StdinData as u8, d).await
@@ -445,7 +480,6 @@ mod tests {
                 command: "echo 'a'".into(),
                 args: vec!["x y".into()],
                 cwd: Some("/tmp".into()),
-                state: Some("declare -- x=1".into()),
                 timeout_ms: Some(5000),
                 session: Some("agent-a".into()),
             }),
@@ -460,11 +494,13 @@ mod tests {
         }
         let mut cur = std::io::Cursor::new(&buf);
         for f in &frames {
-            let got = read_exec_frame(&mut cur).await.unwrap().unwrap();
+            let got = read_exec_frame::<_, ExecRequest>(&mut cur)
+                .await
+                .unwrap()
+                .unwrap();
             match (f, &got) {
                 (ExecFrame::Exec(a), ExecFrame::Exec(b)) => {
                     assert_eq!(a.command, b.command);
-                    assert_eq!(a.state, b.state);
                     assert_eq!(a.timeout_ms, b.timeout_ms);
                     assert_eq!(a.session, b.session);
                 },
@@ -475,7 +511,40 @@ mod tests {
                 (a, b) => panic!("frame kind mismatch: {a:?} vs {b:?}"),
             }
         }
-        assert!(read_exec_frame(&mut cur).await.unwrap().is_none());
+        assert!(
+            read_exec_frame::<_, ExecRequest>(&mut cur)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_exec_roundtrip() {
+        let frame = ExecFrame::Exec(ServeExec {
+            session: "agent-a".into(),
+            command: "echo 'a'".into(),
+            args: vec!["x y".into()],
+            cwd: Some("/tmp".into()),
+            state: Some("declare -- x=1".into()),
+            timeout_ms: Some(5000),
+        });
+        let mut buf = Vec::new();
+        write_exec_frame(&mut buf, &frame).await.unwrap();
+        let mut cur = std::io::Cursor::new(&buf);
+        match read_exec_frame::<_, ServeExec>(&mut cur)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            ExecFrame::Exec(req) => {
+                assert_eq!(req.session, "agent-a");
+                assert_eq!(req.command, "echo 'a'");
+                assert_eq!(req.state.as_deref(), Some("declare -- x=1"));
+                assert_eq!(req.timeout_ms, Some(5000));
+            },
+            other => panic!("wrong frame: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -574,12 +643,16 @@ mod tests {
             _ => panic!("wrong frame"),
         }
 
-        let ex = ExecFrame::StdinData(payload);
+        let ex = ExecFrame::<ExecRequest>::StdinData(payload);
         let mut buf = Vec::new();
         write_exec_frame(&mut buf, &ex).await.unwrap();
         assert_eq!(buf, encode_exec_frame(&ex).unwrap());
         let mut cur = std::io::Cursor::new(&buf);
-        match read_exec_frame(&mut cur).await.unwrap().unwrap() {
+        match read_exec_frame::<_, ExecRequest>(&mut cur)
+            .await
+            .unwrap()
+            .unwrap()
+        {
             ExecFrame::StdinData(d) => assert_eq!(d.len(), PACKED_PAYLOAD_MAX + 1),
             _ => panic!("wrong frame"),
         }

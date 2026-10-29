@@ -13,7 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sp_proto::{EventFrame, ExecFrame, ExecRequest, ExitReport, INTERNAL_ERROR_CODE, Pong, Signal};
+use sp_proto::{
+    EventFrame, ExecFrame, ExecRequest, ExitReport, INTERNAL_ERROR_CODE, Pong, ServeExec, Signal,
+};
 use spdlog::{
     Level, LevelFilter, Logger,
     prelude::*,
@@ -341,19 +343,22 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
             sess.lock.lock().await
         },
     };
-    // The effective request mutates the owned request in place instead of
-    // cloning it: command and client-sent state can be large (script files,
-    // up to 256KB blobs) and the clone's copies would be overwritten right
-    // away.
-    let mut eff_req = req;
-    let start_cwd = eff_req
+    // Assemble the serve request by moving fields out of the owned IPC
+    // request instead of cloning: the command can be a large script file, a
+    // copy would be dead weight. The exit log keeps its abbreviated command.
+    let cmd_log = abbreviate(&req.command);
+    let start_cwd = req
         .cwd
-        .take()
+        .clone()
         .or_else(|| sess.cwd.lock().expect("cwd lock").clone());
-    eff_req.cwd = start_cwd.clone();
-    eff_req
-        .state
-        .clone_from(&sess.state.lock().expect("state lock"));
+    let serve_req = ServeExec {
+        session: session.as_str().to_owned(),
+        command: req.command,
+        args: req.args,
+        cwd: start_cwd.clone(),
+        state: sess.state.lock().expect("state lock").clone(),
+        timeout_ms: req.timeout_ms,
+    };
 
     // Engine input lanes, split by kind at the source: stdin data (Eof rides
     // the same lane, which keeps EOF ordered behind the data) and signals.
@@ -372,7 +377,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
     let frame_reader = tokio::spawn(async move {
         let mut reader = reader;
         loop {
-            match sp_proto::read_exec_frame(&mut reader).await {
+            match sp_proto::read_exec_frame::<_, ExecRequest>(&mut reader).await {
                 Ok(Some(ExecFrame::StdinData(d))) => {
                     if stdin_tx.send(StdinEvent::Data(d)).await.is_err() {
                         return; // engine gone
@@ -452,7 +457,8 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
         let mut engine = std::pin::pin!(remote::execute(
             conn.conn.handle(),
             &conn.serve_path,
-            &eff_req,
+            &req.host,
+            &serve_req,
             stdin_rx,
             sig_rx,
             event_tx,
@@ -463,16 +469,16 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
         // drains are bounded, so a healthy execution always reports before
         // this fires; unlimited requests opt out. Without it one wedged
         // execution would queue every later command on the host lock forever.
-        let watchdog = eff_req
+        let watchdog = req
             .timeout_ms
             .filter(|ms| *ms > 0)
             .and_then(|ms| Duration::from_millis(ms).checked_add(WATCHDOG_GRACE))
             .and_then(deadline_after);
-        if eff_req.timeout_ms.is_some_and(|ms| ms > 0) && watchdog.is_none() {
+        if req.timeout_ms.is_some_and(|ms| ms > 0) && watchdog.is_none() {
             warn!(
                 "host={} timeout_ms={} overflows the clock, running without a watchdog",
-                eff_req.host,
-                eff_req.timeout_ms.unwrap_or_default(),
+                req.host,
+                req.timeout_ms.unwrap_or_default(),
             );
         }
 
@@ -500,7 +506,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
                             warn!(
                                 "host={} client disconnected while the command was running; \
                                  letting it finish",
-                                eff_req.host
+                                req.host
                             );
                         },
                         Some(CtrlEvent::Fatal(msg)) => break Err(msg),
@@ -530,7 +536,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
                     break Err(format!(
                         "watchdog: no exit report within {}ms; the exec channel was closed, see \
                          the daemon log for sp-serve diagnostics",
-                        eff_req.timeout_ms.unwrap_or_default(),
+                        req.timeout_ms.unwrap_or_default(),
                     ));
                 }
             }
@@ -553,15 +559,12 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
         // Evict only the exact instance that failed: a concurrent task may
         // already have reconnected and installed a healthy connection, which
         // an unconditional remove would discard for nothing.
-        if hosts
-            .get(&eff_req.host)
-            .is_some_and(|c| Arc::ptr_eq(c, &conn))
-        {
+        if hosts.get(&req.host).is_some_and(|c| Arc::ptr_eq(c, &conn)) {
             warn!(
                 "host={} connection lost, evicting connection (sessions keep their state)",
-                eff_req.host
+                req.host
             );
-            hosts.remove(&eff_req.host);
+            hosts.remove(&req.host);
         }
     }
 
@@ -596,7 +599,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
 
     info!(
         "exec host={} session={} cwd={} rc={} dur={}ms out={}B err={}B state={}B cmd={}",
-        eff_req.host,
+        req.host,
         session,
         start_cwd.as_deref().unwrap_or("~"),
         report.code,
@@ -604,7 +607,7 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
         stdout_bytes.load(Ordering::Relaxed),
         stderr_bytes.load(Ordering::Relaxed),
         state_bytes,
-        abbreviate(&eff_req.command),
+        cmd_log,
     );
 
     let _ = out_tx.send(EventFrame::Exit(report)).await;

@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use sp_proto::{
-    EventFrame, ExecFrame, ExecRequest, ExitReport, INTERNAL_ERROR_CODE, Signal, TIMEOUT_EXIT_CODE,
-    truncate_utf8,
+    EventFrame, ExecFrame, ExitReport, INTERNAL_ERROR_CODE, ServeExec, SessionId, Signal,
+    TIMEOUT_EXIT_CODE, truncate_utf8,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -71,7 +71,12 @@ async fn inner() -> Result<()> {
     // timed out safely.
     let signals = Signals::install().context("install signal handlers")?;
     let mut stdin = tokio::io::stdin();
-    let req = match tokio::time::timeout(EXEC_WAIT, sp_proto::read_exec_frame(&mut stdin)).await {
+    let req = match tokio::time::timeout(
+        EXEC_WAIT,
+        sp_proto::read_exec_frame::<_, ServeExec>(&mut stdin),
+    )
+    .await
+    {
         Ok(Ok(Some(ExecFrame::Exec(req)))) => req,
         Ok(Ok(Some(other))) => bail!("first frame must be Exec, got {other:?}"),
         Ok(Ok(None)) => bail!("stdin closed before Exec frame"),
@@ -79,10 +84,26 @@ async fn inner() -> Result<()> {
         Err(_) => bail!("timed out waiting for Exec frame"),
     };
     log(&format!(
-        "exec cmd={:?} cwd={:?}",
+        "exec cmd={:?} cwd={:?} session={:?}",
         abbrev(&req.command),
-        req.cwd
+        req.cwd,
+        req.session
     ));
+
+    // Defense in depth: the daemon is trusted to send a validated session
+    // name, but the name enters this process's logs, so never take it on
+    // faith. A failure is reported like a spawn failure below.
+    if let Err(e) = SessionId::parse(&req.session) {
+        let report = ExitReport {
+            code: INTERNAL_ERROR_CODE,
+            cwd: None,
+            state: None,
+            error: Some(format!("invalid session name: {e}")),
+            timed_out: false,
+        };
+        write_exit(&report).await?;
+        return Ok(());
+    }
 
     // Spawn failures (missing bash, fd exhaustion) are reported as a regular
     // Exit frame so the client sees a clean error instead of a dropped channel.
@@ -106,7 +127,7 @@ async fn inner() -> Result<()> {
 
 /// Run the protocol loop until the child exits, then send the Exit frame.
 async fn execute(
-    req: &ExecRequest,
+    req: &ServeExec,
     spawned: Spawned,
     stdin: tokio::io::Stdin,
     signals: Signals,
@@ -189,7 +210,7 @@ async fn execute(
         let stdin_tx = stdin_tx;
         let ping_tx = ping_tx;
         loop {
-            match sp_proto::read_exec_frame(&mut stdin).await {
+            match sp_proto::read_exec_frame::<_, ServeExec>(&mut stdin).await {
                 Ok(Some(ExecFrame::StdinData(d))) => {
                     if stdin_tx.send(StdinMsg::Data(d)).await.is_err() {
                         break; // stdin pump gone (child exited)

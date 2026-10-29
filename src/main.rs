@@ -250,7 +250,6 @@ async fn run_command(cli: Cli, stdin_script: Option<String>) -> ExitCode {
         command,
         args,
         cwd: cli.cwd,
-        state: None,
         timeout_ms: timeout,
         session: Some(session),
     };
@@ -378,7 +377,6 @@ async fn run_doctor(cli: &Cli) -> ExitCode {
         command: r#"echo "os: $(uname -srm)"; echo "bash: $(bash --version | head -1)"; echo "home: $HOME"; echo "cwd: $PWD""#.into(),
         args: Vec::new(),
         cwd: cli.cwd.clone(),
-        state: None,
         timeout_ms: Some(DOCTOR_TIMEOUT_MS),
         session: Some(session),
     };

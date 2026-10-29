@@ -157,7 +157,7 @@ pub async fn ping() -> Result<u32> {
     let mut stream = IpcStream::connect(&path)
         .await
         .map_err(|e| Error::Daemon(format!("daemon not running at {path}: {e}")))?;
-    write_exec_frame(&mut stream, &ExecFrame::Ping).await?;
+    write_exec_frame(&mut stream, &ExecFrame::<ExecRequest>::Ping).await?;
     match tokio::time::timeout(Duration::from_secs(3), read_event_frame(&mut stream)).await {
         Ok(Ok(Some(EventFrame::Pong(p)))) => Ok(p.pid),
         Ok(Ok(other)) => Err(Error::Protocol(format!("unexpected reply: {other:?}"))),
@@ -229,15 +229,15 @@ pub async fn run(
             n = stdin.read(&mut in_buf), if stdin_open => {
                 match n {
                     Ok(0) => {
-                        write_exec_frame(&mut writer, &ExecFrame::StdinEof).await?;
+                        write_exec_frame(&mut writer, &ExecFrame::<ExecRequest>::StdinEof).await?;
                         stdin_open = false;
                     }
                     Ok(n) => {
-                        write_exec_frame(&mut writer, &ExecFrame::StdinData(in_buf[..n].to_vec())).await?;
+                        write_exec_frame(&mut writer, &ExecFrame::<ExecRequest>::StdinData(in_buf[..n].to_vec())).await?;
                     }
                     Err(_) => {
                         // Unreadable stdin: tell the daemon it is done.
-                        let _ = write_exec_frame(&mut writer, &ExecFrame::StdinEof).await;
+                        let _ = write_exec_frame(&mut writer, &ExecFrame::<ExecRequest>::StdinEof).await;
                         stdin_open = false;
                     }
                 }
@@ -274,10 +274,10 @@ pub async fn run(
                             });
                         }
                         last_int = Some(now);
-                        write_exec_frame(&mut writer, &ExecFrame::Signal(Signal::Int)).await?;
+                        write_exec_frame(&mut writer, &ExecFrame::<ExecRequest>::Signal(Signal::Int)).await?;
                     },
                     Some(sig) => {
-                        write_exec_frame(&mut writer, &ExecFrame::Signal(sig)).await?;
+                        write_exec_frame(&mut writer, &ExecFrame::<ExecRequest>::Signal(sig)).await?;
                     },
                     None => signals_open = false,
                 }
@@ -452,7 +452,6 @@ pub fn upload_request(
         command: format!("cat > {}", quote_remote_path(remote)),
         args: Vec::new(),
         cwd,
-        state: None,
         timeout_ms,
         session: Some(session),
     }
@@ -474,7 +473,6 @@ pub fn download_request(
         command: format!("cat {}", quote_remote_path(remote)),
         args: Vec::new(),
         cwd,
-        state: None,
         timeout_ms,
         session: Some(session),
     }

@@ -25,7 +25,7 @@ use std::{
     process::Stdio,
 };
 
-use sp_proto::ExecRequest;
+use sp_proto::ServeExec;
 use tokio::{net::unix::pipe, process::Command};
 
 use crate::wrapper;
@@ -46,7 +46,7 @@ pub struct Spawned {
 }
 
 /// Spawn the bash wrapper for one request.
-pub fn spawn(req: &ExecRequest) -> io::Result<Spawned> {
+pub fn spawn(req: &ServeExec) -> io::Result<Spawned> {
     let (stdin_w, stdin_r) = pipe::pipe()?;
     let (stdout_w, stdout_r) = pipe::pipe()?;
     let (stderr_w, stderr_r) = pipe::pipe()?;
