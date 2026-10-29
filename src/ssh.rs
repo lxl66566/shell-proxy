@@ -581,11 +581,19 @@ pub async fn connect(resolved: ResolvedHost) -> Result<SshConnection> {
 /// Duplex over a ProxyCommand child's pipes.
 type ProxyStream = tokio::io::Join<ChildStdout, ChildStdin>;
 
+/// Suppresses console allocation for child processes: the resident daemon runs
+/// console-less (DETACHED_PROCESS), so a console-subsystem child would pop up
+/// a visible console window unless one is suppressed.
+#[cfg(windows)]
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Spawn a ProxyCommand, wiring its stdout->russh read side and stdin->write side.
 fn spawn_proxy(cmd: &str) -> std::io::Result<(ProxyStream, Child)> {
     let mut command = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(cmd);
+        #[cfg(windows)]
+        c.creation_flags(CREATE_NO_WINDOW);
         c
     } else {
         let mut c = Command::new("sh");

@@ -9,6 +9,8 @@ use spdlog::prelude::*;
 use tokio::process::Command;
 
 use crate::error::{Error, Result};
+#[cfg(windows)]
+use crate::ssh::CREATE_NO_WINDOW;
 
 /// Fully resolved connection parameters for one host alias.
 #[derive(Debug, Clone)]
@@ -94,19 +96,23 @@ fn home_ssh() -> PathBuf {
 }
 
 async fn run_ssh_g(host: &str) -> Result<ResolvedHost> {
-    let out = tokio::time::timeout(
-        Duration::from_secs(10),
-        Command::new("ssh").arg("-G").arg(host).output(),
-    )
-    .await
-    .map_err(|_| Error::Resolve {
-        host: host.to_owned(),
-        reason: "ssh -G timed out".into(),
-    })?
-    .map_err(|e| Error::Resolve {
-        host: host.to_owned(),
-        reason: format!("cannot run ssh: {e}"),
-    })?;
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-G").arg(host);
+    // The resident daemon runs console-less (DETACHED_PROCESS); without this
+    // flag Windows allocates a visible console for the ssh child on every
+    // resolve, flashing a window in the user's session.
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = tokio::time::timeout(Duration::from_secs(10), cmd.output())
+        .await
+        .map_err(|_| Error::Resolve {
+            host: host.to_owned(),
+            reason: "ssh -G timed out".into(),
+        })?
+        .map_err(|e| Error::Resolve {
+            host: host.to_owned(),
+            reason: format!("cannot run ssh: {e}"),
+        })?;
 
     if !out.status.success() {
         return Err(Error::Resolve {
