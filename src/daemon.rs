@@ -1,8 +1,8 @@
 //! The resident daemon: owns one SSH connection and one `sp-serve` deployment
-//! per host (shared by every session there), keeps an independent cwd/state
-//! bucket per (host, session) (commands within a session serialize on it,
-//! sessions run in parallel), streams output back over IPC and logs every
-//! execution.
+//! per host (shared by every session there), keeps the persisted cwd of each
+//! (host, session) pair (shell state lives on the remote host's filesystem;
+//! commands within a session serialize on the session lock, sessions run in
+//! parallel), streams output back over IPC and logs every execution.
 
 use std::{
     collections::HashMap,
@@ -84,14 +84,10 @@ struct HostConn {
     serve_path: String,
 }
 
-/// Session-level state: the persisted cwd and shell state of one
-/// (host, session) pair, plus the lock serializing its executions so state
-/// updates apply in order.
+/// Session-level state: the persisted cwd of one (host, session) pair, plus
+/// the lock serializing its executions so cwd updates apply in order.
 struct SessionState {
     cwd: std::sync::Mutex<Option<String>>,
-    /// Persisted shell state (bash source). Held as an opaque blob; the daemon
-    /// never inspects or logs its contents - env values carry secrets.
-    state: std::sync::Mutex<Option<String>>,
     /// Serializes executions within this session; different sessions run in
     /// parallel over the shared host connection.
     lock: Mutex<()>,
@@ -298,7 +294,6 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
                 .send(EventFrame::Exit(ExitReport {
                     code: INTERNAL_ERROR_CODE,
                     cwd: None,
-                    state: None,
                     error: Some(msg),
                     timed_out: false,
                 }))
@@ -314,7 +309,6 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
                 .send(EventFrame::Exit(ExitReport {
                     code: INTERNAL_ERROR_CODE,
                     cwd: None,
-                    state: None,
                     error: Some(e.brief()),
                     timed_out: false,
                 }))
@@ -356,7 +350,6 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
         command: req.command,
         args: req.args,
         cwd: start_cwd.clone(),
-        state: sess.state.lock().expect("state lock").clone(),
         timeout_ms: req.timeout_ms,
     };
 
@@ -552,8 +545,9 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
 
     // A dead connection cannot be retried transparently (forwarded stdin is
     // gone), so drop the host entry; the next command reconnects on its own.
-    // Session buckets survive the eviction: cwd/state are strings tied to
-    // the session, not the connection, and resume after the reconnect.
+    // Session buckets survive the eviction: cwd is a string tied to the
+    // session, not the connection, and shell state lives on the remote
+    // filesystem; both resume after the reconnect.
     if outcome.is_err() && conn.conn.is_closed() {
         let mut hosts = shared.hosts.lock().await;
         // Evict only the exact instance that failed: a concurrent task may
@@ -561,29 +555,21 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
         // an unconditional remove would discard for nothing.
         if hosts.get(&req.host).is_some_and(|c| Arc::ptr_eq(c, &conn)) {
             warn!(
-                "host={} connection lost, evicting connection (sessions keep their state)",
+                "host={} connection lost, evicting connection (sessions keep their cwd and state)",
                 req.host
             );
             hosts.remove(&req.host);
         }
     }
 
-    let mut state_bytes = 0usize;
     let report = match outcome {
         Ok(o) => {
-            state_bytes = o.new_state.as_deref().map_or(0, str::len);
             if let Some(cwd) = &o.new_cwd {
                 *sess.cwd.lock().expect("cwd lock") = Some(cwd.clone());
-            }
-            if let Some(s) = &o.new_state {
-                *sess.state.lock().expect("state lock") = Some(s.clone());
             }
             ExitReport {
                 code: o.exit_code,
                 cwd: o.new_cwd,
-                // The client cannot use the state blob; only its size is
-                // interesting and that goes to the log below.
-                state: None,
                 error: None,
                 timed_out: o.timed_out,
             }
@@ -591,14 +577,13 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
         Err(msg) => ExitReport {
             code: INTERNAL_ERROR_CODE,
             cwd: None,
-            state: None,
             error: Some(msg),
             timed_out: false,
         },
     };
 
     info!(
-        "exec host={} session={} cwd={} rc={} dur={}ms out={}B err={}B state={}B cmd={}",
+        "exec host={} session={} cwd={} rc={} dur={}ms out={}B err={}B cmd={}",
         req.host,
         session,
         start_cwd.as_deref().unwrap_or("~"),
@@ -606,7 +591,6 @@ async fn handle_exec<S: AsyncRead + Unpin + Send + 'static>(
         started.elapsed().as_millis(),
         stdout_bytes.load(Ordering::Relaxed),
         stderr_bytes.load(Ordering::Relaxed),
-        state_bytes,
         cmd_log,
     );
 
@@ -681,7 +665,7 @@ async fn connect_host(host: &str) -> Result<Arc<HostConn>> {
 
 /// Get the state bucket of one (host, session), creating it on first use.
 /// The table lock is a short critical section; buckets are never removed:
-/// each holds two bounded strings and the daemon lifetime bounds the count.
+/// each holds one bounded string and the daemon lifetime bounds the count.
 async fn get_session(shared: &Arc<Shared>, host: &str, session: &SessionId) -> Arc<SessionState> {
     let key = SessionKey {
         host: host.to_owned(),
@@ -694,7 +678,6 @@ async fn get_session(shared: &Arc<Shared>, host: &str, session: &SessionId) -> A
             debug!("session created host={host} session={session}");
             Arc::new(SessionState {
                 cwd: std::sync::Mutex::new(None),
-                state: std::sync::Mutex::new(None),
                 lock: Mutex::new(()),
             })
         })

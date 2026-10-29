@@ -1,13 +1,21 @@
 //! Protocol loop of sp-serve: one `Exec` request in, run it, frames out.
 //!
-//! serve is stateless and handles exactly one execution, then exits 0. Its own
-//! stderr (diagnostics) travels as SSH extended data and lands in the daemon
-//! log; only frames go to stdout. Signals arrive two ways: in-band `Signal`
-//! frames on stdin (the delivery path for Term, Hup and Kill - delayed while
-//! stdin backpressure stalls) and, for interrupts, out of band as SSH channel
+//! serve handles exactly one execution, then exits 0. Its own stderr
+//! (diagnostics) travels as SSH extended data and lands in the daemon log;
+//! only frames go to stdout. The persisted shell state crosses no wire: it
+//! lives in a per-session file under `$HOME/.local/share/shell-proxy/sessions`
+//! on the remote host - read before the command, written back afterwards.
+//! Signals arrive two ways: in-band `Signal` frames on
+//! stdin (the delivery path for Term, Hup and Kill - delayed while stdin
+//! backpressure stalls) and, for interrupts, out of band as SSH channel
 //! requests that sshd delivers to this process's group (see [`Signals`]).
 
-use std::time::Duration;
+use std::{
+    io::Write as _,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::PathBuf,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use sp_proto::{
@@ -40,9 +48,9 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 /// Cap for the cwd report; anything beyond a path is garbage.
 const CWD_CAP: usize = 8 * 1024;
 /// Cap for the shell state dump; a user command can build huge variables, and
-/// an unbounded dump would balloon the Exit frame and daemon memory. Overflow
-/// keeps the previous state (logged) and the pipe is drained, not cut, so the
-/// child's exit code is untouched.
+/// an unbounded dump would balloon the Exit frame and the state file. Overflow
+/// yields no dump (logged), which keeps the previous state file, and the pipe
+/// is drained, not cut, so the child's exit code is untouched.
 const STATE_CAP: usize = 256 * 1024;
 
 /// Entry point: returns the process exit code.
@@ -91,13 +99,13 @@ async fn inner() -> Result<()> {
     ));
 
     // Defense in depth: the daemon is trusted to send a validated session
-    // name, but the name enters this process's logs, so never take it on
-    // faith. A failure is reported like a spawn failure below.
+    // name, but the name becomes a state file path component below and enters
+    // this process's logs, so never take it on faith. A failure is reported
+    // like a spawn failure below.
     if let Err(e) = SessionId::parse(&req.session) {
         let report = ExitReport {
             code: INTERNAL_ERROR_CODE,
             cwd: None,
-            state: None,
             error: Some(format!("invalid session name: {e}")),
             timed_out: false,
         };
@@ -105,15 +113,28 @@ async fn inner() -> Result<()> {
         return Ok(());
     }
 
-    // Spawn failures (missing bash, fd exhaustion) are reported as a regular
-    // Exit frame so the client sees a clean error instead of a dropped channel.
-    let spawned = match child::spawn(&req) {
+    // Failures around the spawn (missing bash, fd exhaustion, no $HOME for
+    // the state file) are reported as a regular Exit frame so the client sees
+    // a clean error instead of a dropped channel.
+    let prev_state = match load_state(&req.session) {
         Ok(s) => s,
         Err(e) => {
             let report = ExitReport {
                 code: INTERNAL_ERROR_CODE,
                 cwd: None,
-                state: None,
+                error: Some(format!("session state: {e:#}")),
+                timed_out: false,
+            };
+            write_exit(&report).await?;
+            return Ok(());
+        },
+    };
+    let spawned = match child::spawn(&req, prev_state.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            let report = ExitReport {
+                code: INTERNAL_ERROR_CODE,
+                cwd: None,
                 error: Some(format!("spawn bash: {e}")),
                 timed_out: false,
             };
@@ -412,6 +433,15 @@ async fn execute(
         },
     };
 
+    // A dump replaces the state file; a `None` dump (nothing reported, the
+    // collect task failed, or the reasons read_pipe logs itself) keeps the
+    // previous file - the same "keep previous state" semantics the daemon-side
+    // bucket had. The file is the next command's restore source (load_state).
+    match &new_state {
+        Some(s) => save_state(&req.session, s),
+        None => log("no state dump; keeping the previous state"),
+    }
+
     let report = ExitReport {
         code: if timed_out {
             TIMEOUT_EXIT_CODE
@@ -419,7 +449,6 @@ async fn execute(
             code
         },
         cwd: new_cwd,
-        state: new_state,
         error: None,
         timed_out,
     };
@@ -614,6 +643,118 @@ async fn drain_pumps(
             },
             () = tokio::time::sleep_until(stop_at) => return false,
         }
+    }
+}
+
+// -- shell state on the remote filesystem -------------------------------------
+
+/// Directory holding the per-session state files, relative to the remote
+/// `$HOME` (same base directory the sp-serve binary itself is deployed to).
+const STATE_DIR: &str = ".local/share/shell-proxy/sessions";
+
+/// Directory of the session state files and the state file of `session`;
+/// `None` when `$HOME` is unset.
+fn state_paths(session: &str) -> Option<(PathBuf, PathBuf)> {
+    let home = std::env::var_os("HOME")?;
+    let dir = std::path::Path::new(&home).join(STATE_DIR);
+    Some((dir.clone(), dir.join(format!("{session}.state"))))
+}
+
+/// Load the persisted shell state of `session` from the remote filesystem.
+///
+/// A missing file is a fresh session (`None`). An oversized, unreadable or
+/// non-UTF-8 file is logged and treated as `None`: state persistence is
+/// best-effort and must never fail the command itself. `Err` is reserved for
+/// a missing `$HOME`, where no state location exists at all - reported to the
+/// daemon like a spawn failure instead of silently dropping persistence.
+fn load_state(session: &str) -> Result<Option<String>> {
+    let Some((_, path)) = state_paths(session) else {
+        bail!("$HOME is not set, cannot locate the session state file");
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            log(&format!(
+                "state file {} unreadable: {e}; starting without it",
+                path.display()
+            ));
+            return Ok(None);
+        },
+    };
+    if bytes.len() > STATE_CAP {
+        log(&format!(
+            "state file {} exceeds {STATE_CAP} bytes, starting without it",
+            path.display()
+        ));
+        return Ok(None);
+    }
+    match String::from_utf8(bytes) {
+        Ok(s) if !s.is_empty() => Ok(Some(s)),
+        Ok(_) => Ok(None),
+        Err(_) => {
+            log(&format!(
+                "state file {} is not valid UTF-8, starting without it",
+                path.display()
+            ));
+            Ok(None)
+        },
+    }
+}
+
+/// Persist the post-command shell state to the remote filesystem.
+///
+/// The dump replaces the state file atomically: it is written to a temp file
+/// in the target directory and renamed over the file, so a crash mid-write
+/// can never leave a half-written state behind, and a concurrent reader (a
+/// second daemon sharing this account) sees either the old or the new file,
+/// never a partial one. File mode 0600, directory 0700: the dump carries the
+/// user's whole environment, secrets included. Every failure is logged and
+/// otherwise ignored - the previous file stays untouched and the command
+/// result is unaffected.
+fn save_state(session: &str, state: &str) {
+    if state.len() > STATE_CAP {
+        // Unreachable today (read_pipe drops over-cap dumps); kept as a guard
+        // so a future dump source cannot balloon the file.
+        log(&format!(
+            "state dump of {} bytes exceeds {STATE_CAP} bytes, keeping the previous state",
+            state.len()
+        ));
+        return;
+    }
+    let Some((dir, path)) = state_paths(session) else {
+        log("no $HOME, state not saved");
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log(&format!("create {}: {e}; state not saved", dir.display()));
+        return;
+    }
+    // create_dir_all applies the process umask; pin the mode afterwards.
+    if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+        log(&format!("chmod 700 {}: {e}", dir.display()));
+        return;
+    }
+    // The pid keeps the temp name unique: one serve process runs one command,
+    // and distinct sessions use distinct state files.
+    let tmp = dir.join(format!(".{}.{}.tmp", session, std::process::id()));
+    let saved = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(state.as_bytes())?;
+        // rename(2) is atomic within one filesystem, which is why the temp
+        // file lives in the target directory.
+        std::fs::rename(&tmp, &path)
+    })();
+    match saved {
+        Ok(()) => log(&format!("state saved ({} bytes)", state.len())),
+        Err(e) => {
+            log(&format!("state not saved: {e}"));
+            let _ = std::fs::remove_file(&tmp);
+        },
     }
 }
 

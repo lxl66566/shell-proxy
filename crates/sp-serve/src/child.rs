@@ -45,8 +45,9 @@ pub struct Spawned {
     pub state: pipe::Receiver,
 }
 
-/// Spawn the bash wrapper for one request.
-pub fn spawn(req: &ServeExec) -> io::Result<Spawned> {
+/// Spawn the bash wrapper for one request. `state` is the persisted shell
+/// state (bash source) to eval after the rcfile and the cd, or `None`.
+pub fn spawn(req: &ServeExec, state: Option<&str>) -> io::Result<Spawned> {
     let (stdin_w, stdin_r) = pipe::pipe()?;
     let (stdout_w, stdout_r) = pipe::pipe()?;
     let (stderr_w, stderr_r) = pipe::pipe()?;
@@ -72,10 +73,7 @@ pub fn spawn(req: &ServeExec) -> io::Result<Spawned> {
     fill(&mut cmd_file, req.command.as_bytes())?;
     let mut state_file = memfd(c"sp-state")?;
     let restore_fd = state_file.as_raw_fd();
-    fill(
-        &mut state_file,
-        req.state.as_deref().unwrap_or("").as_bytes(),
-    )?;
+    fill(&mut state_file, state.unwrap_or("").as_bytes())?;
 
     let mut cmd = Command::new("bash");
     cmd.arg("--noprofile")

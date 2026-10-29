@@ -85,8 +85,6 @@ pub struct ExecOutcome {
     pub exit_code: i32,
     /// New persisted cwd when the serve wrapper reported it.
     pub new_cwd: Option<String>,
-    /// New persisted shell state dump when the serve wrapper reported one.
-    pub new_state: Option<String>,
     pub timed_out: bool,
 }
 
@@ -514,7 +512,6 @@ pub async fn execute(
         Some(rep) => Ok(ExecOutcome {
             exit_code: rep.code,
             new_cwd: rep.cwd,
-            new_state: rep.state,
             timed_out: rep.timed_out,
         }),
         None => Err(Error::Remote(format!(
